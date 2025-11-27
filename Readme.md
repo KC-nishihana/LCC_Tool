@@ -1,58 +1,58 @@
-# LCC Tool for Blender
+# Blender用 LCCツール
 
-LCC Tool is a Blender add-on designed to import and render LCC (Lightweight Compressed Cloud) splat data. It allows users to load `.lcc` files, visualize them using Geometry Nodes, and set up high-quality 360° panoramic renders using the Cycles engine.
+LCCツールは、LCC（Lightweight Compressed Cloud）スプラットデータをインポートしてレンダリングするために設計されたBlenderアドオンです。`.lcc`ファイルを読み込み、ジオメトリノードを使用して可視化し、Cyclesエンジンを使用して高品質な360度パノラマレンダリングをセットアップすることができます。
 
-## Features
+## 機能
 
-*   **LCC Import**: Reads `.lcc` files along with their associated `Index.bin` and `Data.bin` data.
-*   **LOD Support**: Selectable Level of Detail (LOD) to balance between quality and performance.
-*   **Geometry Nodes Rendering**: Automatically sets up a Geometry Nodes modifier to render splats as 3D ellipsoids.
-*   **Custom Shader**: Generates a `GaussianSplatMat` material with Gaussian falloff for accurate splat visualization.
-*   **360° Render Setup**: Optionally configures a panoramic camera and optimizes Cycles settings for transparency and heavy particle counts.
-*   **User-Friendly Panel**: Accessible via the "LCC Tools" tab in the 3D View sidebar.
+*   **LCCインポート**: `.lcc`ファイルとそれに関連する `Index.bin` および `Data.bin` データを読み込みます。
+*   **LOD（詳細度）サポート**: 品質とパフォーマンスのバランスを取るために、詳細度（LOD）を選択可能です。
+*   **ジオメトリノードレンダリング**: スプラットを3D楕円体としてレンダリングするためのジオメトリノードモディファイアを自動的にセットアップします。
+*   **カスタムシェーダー**: 正確なスプラット表現のために、ガウス減衰（Gaussian falloff）を持つ `GaussianSplatMat` マテリアルを生成します。
+*   **360度レンダリングセットアップ**: パノラマカメラを自動的に構成し、透過処理や大量のパーティクル向けにCyclesの設定を最適化するオプションがあります。
+*   **使いやすいパネル**: 3Dビューのサイドバーにある「LCC Tools」タブからアクセスできます。
 
-## Requirements
+## 必須要件
 
-*   **Blender**: Version 3.3 or higher (Recommended for Geometry Nodes compatibility).
-*   **Python Dependencies**: `numpy` (Standard with Blender).
+*   **Blender**: バージョン 3.3 以上（ジオメトリノードの互換性のため推奨）。
+*   **Python ライブラリ**: `numpy`（Blenderに標準搭載されています）。
 
-## Installation
+## インストール方法
 
-1.  Download `LCC_Render.py`.
-2.  Open Blender.
-3.  Go to **Edit > Preferences > Add-ons**.
-4.  Click **Install...** and select `LCC_Render.py`.
-5.  Enable the add-on by checking the box next to **Import-Export: LCC Tools**.
-    *   *Alternatively, you can open the script in the Scripting workspace and run it directly.*
+1.  `LCC_Render.py` をダウンロードします。
+2.  Blenderを開きます。
+3.  **編集 (Edit) > プリファレンス (Preferences) > アドオン (Add-ons)** に移動します。
+4.  **インストール... (Install...)** をクリックし、`LCC_Render.py` を選択します。
+5.  **Import-Export: LCC Tools** のチェックボックスをオンにして、アドオンを有効にします。
+    *   *または、Scriptingワークスペースでスクリプトを開き、直接実行することも可能です。*
 
-## Usage
+## 使用方法
 
-1.  In the 3D Viewport, press `N` to open the sidebar.
-2.  Click on the **LCC Tools** tab.
-3.  Click the **Import LCC (.lcc)** button.
-4.  Navigate to and select your `.lcc` file.
-5.  Adjust the import settings in the file browser sidebar (bottom left) or popup:
-    *   **LOD Level**: Choose the detail level (0 is highest, but heaviest).
-    *   **Splat Scale Multiplier**: Adjust the size of splats to fill gaps (default: 1.5).
-    *   **Min Thickness**: Set a minimum thickness to prevent splats from disappearing at glancing angles.
-    *   **Setup 360 Render**: Check this to automatically create a panorama camera and optimize render settings.
-6.  Click **Import LCC** to finish.
+1.  3Dビューポートで `N` キーを押してサイドバーを開きます。
+2.  **LCC Tools** タブをクリックします。
+3.  **Import LCC (.lcc)** ボタンをクリックします。
+4.  対象の `.lcc` ファイルを探して選択します。
+5.  ファイルブラウザのサイドバー（左下）またはポップアップでインポート設定を調整します：
+    *   **LOD Level**: 詳細レベルを選択します（0が最高品質ですが、最も重くなります）。
+    *   **Splat Scale Multiplier**: 隙間を埋めるためにスプラットのサイズを調整します（デフォルト: 1.5）。
+    *   **Min Thickness**: 最小の厚みを設定し、角度によってスプラットが消えて見えるのを防ぎます。
+    *   **Setup 360 Render**: これにチェックを入れると、自動的にパノラマカメラを作成し、レンダリング設定を最適化します。
+6.  **Import LCC** をクリックして完了します。
 
-## Import Settings
+## インポート設定の詳細
 
-*   **LOD Level**: Controls the density of the imported cloud.
-    *   `0`: Full resolution (Heavy).
-    *   `1-5`: Lower resolutions for faster viewport performance.
-*   **Splat Scale Multiplier**: Multiplies the scale of every splat. Higher values create a solid surface look but may appear "blobby".
-*   **Min Thickness**: Enforces a minimum scale on the smallest axis of the splat ellipsoid. Useful for preventing artifacts when looking at flat splats from the side.
+*   **LOD Level**: インポートされる点群の密度を制御します。
+    *   `0`: フル解像度（重い）。
+    *   `1-5`: ビューポートのパフォーマンス向上のための低解像度版。
+*   **Splat Scale Multiplier**: 全てのスプラットのスケールを乗算します。値を大きくすると表面が埋まって見えますが、「塊」のように見える場合があります。
+*   **Min Thickness**: スプラット楕円体の最小軸に対して最小スケールを強制します。平らなスプラットを横から見た際にアーティファクトが発生するのを防ぐのに役立ちます。
 *   **Setup 360 Render**:
-    *   Switches render engine to **Cycles**.
-    *   Creates a **PanoramaCam** at (0,0,0).
-    *   Sets resolution to 4096x2048.
-    *   Increases transparency bounces to handle many overlapping semi-transparent splats.
+    *   レンダリングエンジンを **Cycles** に切り替えます。
+    *   (0,0,0) の位置に **PanoramaCam** を作成します。
+    *   解像度を 4096x2048 に設定します。
+    *   多数の重なり合う半透明スプラットを処理するために、透過バウンス数（Transparency bounces）を増やします。
 
-## Technical Details
+## 技術的詳細
 
-The importer reads a custom binary format where splat data (Position, Color, Scale, Rotation) is distributed across `Index.bin` and `Data.bin`.
-*   **Rotations** are decoded from a packed uint32 format into Quaternions and then Euler angles.
-*   **Rendering** is handled by instancing Ico Spheres on points using Geometry Nodes. The visual appearance is controlled by a shader that calculates a Gaussian alpha falloff from the center of each instance.
+インポーターは、スプラットデータ（位置、色、スケール、回転）が `Index.bin` と `Data.bin` に分散されたカスタムバイナリ形式を読み込みます。
+*   **回転**は、パックされた uint32 形式からクォータニオンにデコードされ、その後オイラー角に変換されます。
+*   **レンダリング**は、ジオメトリノードを使用してポイント上にIco Sphere（アイコスフィア）をインスタンス化することで処理されます。見た目は、各インスタンスの中心からのガウスアルファ減衰を計算するシェーダーによって制御されます。
