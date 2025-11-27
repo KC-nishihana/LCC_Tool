@@ -5,6 +5,7 @@ import struct
 import numpy as np
 import math
 from mathutils import Quaternion, Vector, Matrix
+from bpy_extras.object_utils import world_to_camera_view
 
 # ------------------------------------------------------------------------
 # LCC Decoding Logic
@@ -87,7 +88,6 @@ class LCCParser:
             raise FileNotFoundError("Index.bin not found")
 
         total_level = self.meta.get("totalLevel", 1)
-        # Unit Entry Size calculation based on white paper structure
         unit_entry_size = 4 + (4 + 8 + 4) * total_level
         
         units = []
@@ -97,38 +97,38 @@ class LCCParser:
         with open(index_path, 'rb') as f:
             for i in range(num_units):
                 data = f.read(unit_entry_size)
-                unit_idx = struct.unpack('<I', data[0:4])[0]
-                offset_in_entry = 4 + lod_level * 16
-                pc, lo, ls = struct.unpack('<IQI', data[offset_in_entry : offset_in_entry+16])
+                # Parse unit data for the specific LOD level
+                base_off = 4 + lod_level * 16
                 
-                if pc > 0:
+                count = struct.unpack_from('<I', data, base_off)[0]
+                offset = struct.unpack_from('<Q', data, base_off + 4)[0]
+                size = struct.unpack_from('<I', data, base_off + 12)[0]
+                
+                if count > 0:
                     units.append({
-                        'unit_index': unit_idx,
-                        'count': pc,
-                        'offset': lo,
-                        'size': ls
+                        'count': count,
+                        'offset': offset,
+                        'size': size
                     })
         return units
 
-    def read_splat_data(self, units):
+    def iter_chunks(self, units, batch_size=1000000):
         data_path = os.path.join(self.dir_path, "Data.bin")
         if not os.path.exists(data_path):
             raise FileNotFoundError("Data.bin not found")
-
-        total_splats = sum(u['count'] for u in units)
-        print(f"Reading {total_splats} splats from Data.bin...")
-
-        positions_list = []
-        colors_list = []
-        scales_list = []
-        rots_list = []
+            
+        current_pos = []
+        current_col = []
+        current_scl = []
+        current_rot = []
+        current_count = 0
         
         with open(data_path, 'rb') as f:
             for u in units:
                 f.seek(u['offset'])
                 raw_bytes = f.read(u['size'])
-                
                 count = u['count']
+                
                 if len(raw_bytes) < count * 32:
                     print(f"Warning: Unit data smaller than expected. Skipping.")
                     continue
@@ -149,36 +149,35 @@ class LCCParser:
                 rot_raw = chunk_matrix[:, 22:26].copy()
                 rot_data = rot_raw.view(dtype=np.uint32).reshape(count)
                 
-                positions_list.append(pos_data)
-                colors_list.append(col_data)
-                scales_list.append(scl_data)
-                rots_list.append(rot_data)
-        
-        if not positions_list:
-             return np.array([]), np.array([]), np.array([]), np.array([])
-             
-        positions = np.concatenate(positions_list)
-        colors_uint = np.concatenate(colors_list)
-        scales_uint = np.concatenate(scales_list)
-        rots_uint = np.concatenate(rots_list)
-
-        return positions, colors_uint, scales_uint, rots_uint
+                current_pos.append(pos_data)
+                current_col.append(col_data)
+                current_scl.append(scl_data)
+                current_rot.append(rot_data)
+                current_count += count
+                
+                if current_count >= batch_size:
+                    yield (
+                        np.concatenate(current_pos),
+                        np.concatenate(current_col),
+                        np.concatenate(current_scl),
+                        np.concatenate(current_rot)
+                    )
+                    current_pos = []
+                    current_col = []
+                    current_scl = []
+                    current_rot = []
+                    current_count = 0
+                    
+        if current_count > 0:
+            yield (
+                np.concatenate(current_pos),
+                np.concatenate(current_col),
+                np.concatenate(current_scl),
+                np.concatenate(current_rot)
+            )
 
     def decode_attributes(self, colors_u, scales_u, rots_u):
-        colors_u = np.ascontiguousarray(colors_u)
-        scales_u = np.ascontiguousarray(scales_u)
-        rots_u = np.ascontiguousarray(rots_u)
-        
-        count = len(colors_u)
-        
-        colors_bytes = colors_u.view(dtype=np.uint8).reshape((count, 4))
-        colors = colors_bytes.astype(np.float32) / 255.0
-        
-        if count > 0:
-            avg_color = np.mean(colors, axis=0)
-            print(f"Debug: First Raw Color Uint32: {colors_u[0]}")
-            print(f"Debug: First Color Float: {colors[0]}")
-            print(f"Debug: Loaded {count} colors. Average RGBA: {avg_color}")
+        colors = colors_u.view(dtype=np.uint8).reshape(-1, 4).astype(np.float32) / 255.0
         
         scale_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'scale'), None)
         if scale_meta:
@@ -192,11 +191,45 @@ class LCCParser:
         scales = s_min + scales_norm * (s_max - s_min)
         
         quats_np = decode_rotation(rots_u)
-        
-        print("Converting rotations to Euler...")
         eulers = quaternion_to_euler_numpy(quats_np)
             
         return colors, scales, eulers
+
+# ------------------------------------------------------------------------
+# Frustum Culling Logic
+# ------------------------------------------------------------------------
+
+def update_frustum_culling(scene):
+    cam = scene.camera
+    if not cam: return
+    
+    # Only run if we have imported chunks
+    if "LCC_Imported" not in bpy.data.collections:
+        return
+        
+    chunks = [obj for obj in bpy.data.collections["LCC_Imported"].objects if obj.type == 'MESH']
+    if not chunks: return
+
+    for obj in chunks:
+        # Simple check: project object location to camera view
+        # This assumes the chunk's origin is somewhat central or indicative.
+        # For better accuracy, one might check bounding box corners.
+        co = obj.location
+        co_ndc = world_to_camera_view(scene, cam, co)
+        
+        # Check if within 0..1 range (with some margin) and in front of camera (z > 0)
+        margin = 0.2 
+        visible = (
+            -margin <= co_ndc.x <= 1.0 + margin and
+            -margin <= co_ndc.y <= 1.0 + margin and
+            co_ndc.z > 0
+        )
+        
+        # Also check distance for far clipping
+        if visible and co_ndc.z > cam.data.clip_end:
+            visible = False
+            
+        obj.hide_viewport = not visible
 
 # ------------------------------------------------------------------------
 # Blender Operator
@@ -204,18 +237,57 @@ class LCCParser:
 
 class IMPORT_OT_lcc(bpy.types.Operator):
     bl_idname = "import_scene.lcc"
-    bl_label = "Import LCC"
+    bl_label = "Import LCC (Chunked + Culling)"
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     
     lod_min: bpy.props.IntProperty(name="Min LOD", default=0, min=0, max=5)
     lod_max: bpy.props.IntProperty(name="Max LOD", default=3, min=0, max=8)
-    
     scale_density: bpy.props.FloatProperty(name="Scale Multiplier", default=1.5, min=0.1)
     min_thickness: bpy.props.FloatProperty(name="Min Thickness", default=0.05, min=0.0)
     lod_distance: bpy.props.FloatProperty(name="LOD Distance", default=20.0, min=1.0)
     setup_render: bpy.props.BoolProperty(name="Setup 360 Render", default=True)
+
+    def create_chunk_object(self, context, chunk_id, positions, colors, scales, rots):
+        """
+        Creates a Mesh object for a chunk of data (vertices only).
+        """
+        mesh_name = f"LCC_Chunk_{chunk_id}"
+        mesh = bpy.data.meshes.new(name=mesh_name)
+        
+        num_points = len(positions)
+        mesh.vertices.add(num_points)
+        
+        # Set coordinates
+        mesh.vertices.foreach_set("co", positions.flatten())
+        
+        # Set attributes
+        attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
+        attr_col.data.foreach_set("color", colors.flatten())
+        
+        attr_scl = mesh.attributes.new(name="SplatScale", type='FLOAT_VECTOR', domain='POINT')
+        attr_scl.data.foreach_set("vector", scales.flatten())
+        
+        attr_rot = mesh.attributes.new(name="SplatRotation", type='FLOAT_VECTOR', domain='POINT')
+        attr_rot.data.foreach_set("vector", rots.flatten())
+        
+        # Create object
+        obj = bpy.data.objects.new(mesh_name, mesh)
+        
+        # Link to collection
+        if "LCC_Imported" not in bpy.data.collections:
+            coll = bpy.data.collections.new("LCC_Imported")
+            context.scene.collection.children.link(coll)
+        else:
+            coll = bpy.data.collections["LCC_Imported"]
+            
+        coll.objects.link(obj)
+        
+        # Apply Geometry Nodes
+        self.create_geonodes(obj, self.scale_density, self.min_thickness, self.lod_distance)
+        
+        return obj
 
     def execute(self, context):
         if not self.filepath.lower().endswith(".lcc"):
@@ -228,30 +300,37 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         target_lod_start = self.lod_min
         target_lod_end = self.lod_max
-
-        all_pos, all_col, all_scl, all_rot, all_lod = [], [], [], [], []
         
         start_lod = min(target_lod_start, target_lod_end)
         end_lod = max(target_lod_start, target_lod_end)
+        
         total_points = 0
+        chunk_id = 0
         
         try:
+            # Collect all units first to pass to iter_chunks
+            all_units = []
             for lvl in range(start_lod, end_lod + 1):
                 units = parser.get_lod_info(lvl)
-                if not units: continue
-                # No skipping
-                p, c, s, r = parser.read_splat_data(units)
+                if units:
+                    all_units.extend(units)
+            
+            if not all_units:
+                self.report({'WARNING'}, "No data found for selected LODs.")
+                return {'CANCELLED'}
+
+            # Iterate chunks
+            for pos, col_u, scl_u, rot_u in parser.iter_chunks(all_units, batch_size=1000000):
+                # Decode attributes for this chunk
+                col, scl, rot = parser.decode_attributes(col_u, scl_u, rot_u)
                 
-                c_dec, s_dec, r_dec = parser.decode_attributes(c, s, r)
-                all_pos.append(p)
-                all_col.append(c_dec)
-                all_scl.append(s_dec)
-                all_rot.append(r_dec)
+                # Create object
+                self.create_chunk_object(context, chunk_id, pos, col, scl, rot)
                 
-                count = len(p)
-                all_lod.append(np.full(count, lvl, dtype=np.int32))
+                count = len(pos)
                 total_points += count
-                print(f"Loaded LOD {lvl}: {count} points")
+                print(f"Created Chunk {chunk_id}: {count} points")
+                chunk_id += 1
                 
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
@@ -263,56 +342,38 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             self.report({'WARNING'}, "No data loaded.")
             return {'CANCELLED'}
 
-        final_pos = np.ascontiguousarray(np.concatenate(all_pos), dtype=np.float32)
-        final_col = np.ascontiguousarray(np.concatenate(all_col), dtype=np.float32)
-        final_scl = np.ascontiguousarray(np.concatenate(all_scl), dtype=np.float32)
-        final_rot = np.ascontiguousarray(np.concatenate(all_rot), dtype=np.float32)
-        final_lod = np.ascontiguousarray(np.concatenate(all_lod), dtype=np.int32)
-
-        print(f"--- DATA DEBUG ---")
-        print(f"First Color: {final_col[0]}") 
-
-        mesh_name = "LCC_Splats"
-        mesh = bpy.data.meshes.new(mesh_name)
-        obj = bpy.data.objects.new(mesh_name, mesh)
-        context.collection.objects.link(obj)
-
-        mesh.vertices.add(total_points)
-        mesh.vertices.foreach_set("co", final_pos.flatten())
-        
-        color_attr = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
-        color_attr.data.foreach_set("color", final_col.flatten())
-
-        scale_attr = mesh.attributes.new(name="SplatScale", type='FLOAT_VECTOR', domain='POINT')
-        scale_attr.data.foreach_set("vector", final_scl.flatten())
-        
-        rot_attr = mesh.attributes.new(name="SplatRotation", type='FLOAT_VECTOR', domain='POINT')
-        rot_attr.data.foreach_set("vector", final_rot.flatten())
-        
-        lod_attr = mesh.attributes.new(name="SplatLOD", type='INT', domain='POINT')
-        lod_attr.data.foreach_set("value", final_lod.flatten())
-
-        mesh.update()
-
-        self.create_geonodes(obj, self.scale_density, self.min_thickness, self.lod_distance)
-
         if self.setup_render:
             self.setup_360_camera()
             self.optimize_cycles_for_transparency()
             
-        self.report({'INFO'}, f"Imported {total_points} splats.")
+        self.report({'INFO'}, f"Imported {total_points} splats in {chunk_id} chunks.")
         return {'FINISHED'}
 
     def cleanup_old_objects(self):
         for obj in bpy.data.objects:
-            if "LCC_Splats" in obj.name:
+            if "LCC_Splats" in obj.name or "LCC_Chunk_" in obj.name:
                 bpy.data.objects.remove(obj, do_unlink=True)
+        
+        # Clean up collection if empty
+        if "LCC_Imported" in bpy.data.collections:
+            coll = bpy.data.collections["LCC_Imported"]
+            if not coll.objects:
+                bpy.data.collections.remove(coll)
 
     def create_geonodes(self, obj, density, thickness, lod_dist_factor):
         modifier = obj.modifiers.new(name="LCCSplatRenderer", type='NODES')
-        node_group = bpy.data.node_groups.new("LCC_GN", "GeometryNodeTree")
-        modifier.node_group = node_group
         
+        # Check if node group exists to reuse it (optimization)
+        group_name = "LCC_GN"
+        if group_name in bpy.data.node_groups:
+            node_group = bpy.data.node_groups[group_name]
+        else:
+            node_group = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+            self._build_geonodes_tree(node_group, density, thickness, lod_dist_factor)
+            
+        modifier.node_group = node_group
+
+    def _build_geonodes_tree(self, node_group, density, thickness, lod_dist_factor):
         node_group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
         node_group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
 
@@ -575,7 +636,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 class LCC_PT_Panel(bpy.types.Panel):
-    bl_label = "LCC Tools3"
+    bl_label = "LCC Tools (Chunked + Culling)"
     bl_idname = "LCC_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -593,10 +654,16 @@ def register():
         except: pass
     for cls in classes:
         bpy.utils.register_class(cls)
+    
+    if update_frustum_culling not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(update_frustum_culling)
 
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
+    
+    if update_frustum_culling in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(update_frustum_culling)
 
 if __name__ == "__main__":
     register()
