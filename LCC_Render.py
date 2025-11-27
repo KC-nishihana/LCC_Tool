@@ -47,6 +47,29 @@ def decode_rotation(encoded_array):
         
     return result
 
+def quaternion_to_euler_numpy(quats):
+    """
+    Convert Quaternion (x, y, z, w) to Euler angles (XYZ) using pure numpy.
+    """
+    x = quats[:, 0]
+    y = quats[:, 1]
+    z = quats[:, 2]
+    w = quats[:, 3]
+
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = np.arctan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = np.clip(t2, -1.0, 1.0)
+    pitch_y = np.arcsin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = np.arctan2(t3, t4)
+
+    return np.stack((roll_x, pitch_y, yaw_z), axis=-1).astype(np.float32)
+
 class LCCParser:
     def __init__(self, meta_path):
         self.meta_path = meta_path
@@ -64,19 +87,17 @@ class LCCParser:
             raise FileNotFoundError("Index.bin not found")
 
         total_level = self.meta.get("totalLevel", 1)
+        # Unit Entry Size calculation based on white paper structure
         unit_entry_size = 4 + (4 + 8 + 4) * total_level
         
         units = []
         file_size = os.path.getsize(index_path)
         num_units = file_size // unit_entry_size
         
-        print(f"LCC Info: Found {num_units} units, {total_level} levels.")
-
         with open(index_path, 'rb') as f:
             for i in range(num_units):
                 data = f.read(unit_entry_size)
                 unit_idx = struct.unpack('<I', data[0:4])[0]
-                
                 offset_in_entry = 4 + lod_level * 16
                 pc, lo, ls = struct.unpack('<IQI', data[offset_in_entry : offset_in_entry+16])
                 
@@ -97,13 +118,10 @@ class LCCParser:
         total_splats = sum(u['count'] for u in units)
         print(f"Reading {total_splats} splats from Data.bin...")
 
-        positions = np.zeros((total_splats, 3), dtype=np.float32)
-        colors_uint = np.zeros((total_splats,), dtype=np.uint32)
-        scales_uint = np.zeros((total_splats, 3), dtype=np.uint16)
-        rots_uint = np.zeros((total_splats,), dtype=np.uint32)
-        
-        current_idx = 0
-        stride = 32
+        positions_list = []
+        colors_list = []
+        scales_list = []
+        rots_list = []
         
         with open(data_path, 'rb') as f:
             for u in units:
@@ -111,46 +129,57 @@ class LCCParser:
                 raw_bytes = f.read(u['size'])
                 
                 count = u['count']
-                expected_size = count * stride
-                if len(raw_bytes) < expected_size:
+                if len(raw_bytes) < count * 32:
                     print(f"Warning: Unit data smaller than expected. Skipping.")
                     continue
                 
-                chunk_data = np.frombuffer(raw_bytes[:expected_size], dtype=np.uint8)
+                chunk_data = np.frombuffer(raw_bytes[:count*32], dtype=np.uint8)
                 chunk_matrix = chunk_data.reshape((count, 32))
                 
-                # Position (0-12 bytes)
-                pos_bytes = chunk_matrix[:, 0:12].tobytes()
-                positions[current_idx : current_idx+count] = np.frombuffer(pos_bytes, dtype=np.float32).reshape((count, 3))
+                # Copy data to ensure contiguous memory layout
+                pos_raw = chunk_matrix[:, 0:12].copy()
+                pos_data = pos_raw.view(dtype=np.float32).reshape(count, 3)
                 
-                # Color (12-16 bytes)
-                col_bytes = chunk_matrix[:, 12:16].tobytes()
-                colors_uint[current_idx : current_idx+count] = np.frombuffer(col_bytes, dtype=np.uint32)
+                col_raw = chunk_matrix[:, 12:16].copy()
+                col_data = col_raw.view(dtype=np.uint32).reshape(count)
                 
-                # Scale (16-22 bytes)
-                scl_bytes = chunk_matrix[:, 16:22].tobytes()
-                scales_uint[current_idx : current_idx+count] = np.frombuffer(scl_bytes, dtype=np.uint16).reshape((count, 3))
+                scl_raw = chunk_matrix[:, 16:22].copy()
+                scl_data = scl_raw.view(dtype=np.uint16).reshape(count, 3)
                 
-                # Rotation (22-26 bytes)
-                rot_bytes = chunk_matrix[:, 22:26].tobytes()
-                rots_uint[current_idx : current_idx+count] = np.frombuffer(rot_bytes, dtype=np.uint32)
+                rot_raw = chunk_matrix[:, 22:26].copy()
+                rot_data = rot_raw.view(dtype=np.uint32).reshape(count)
                 
-                current_idx += count
+                positions_list.append(pos_data)
+                colors_list.append(col_data)
+                scales_list.append(scl_data)
+                rots_list.append(rot_data)
+        
+        if not positions_list:
+             return np.array([]), np.array([]), np.array([]), np.array([])
+             
+        positions = np.concatenate(positions_list)
+        colors_uint = np.concatenate(colors_list)
+        scales_uint = np.concatenate(scales_list)
+        rots_uint = np.concatenate(rots_list)
 
         return positions, colors_uint, scales_uint, rots_uint
 
     def decode_attributes(self, colors_u, scales_u, rots_u):
+        colors_u = np.ascontiguousarray(colors_u)
+        scales_u = np.ascontiguousarray(scales_u)
+        rots_u = np.ascontiguousarray(rots_u)
+        
         count = len(colors_u)
         
-        # Color
         colors_bytes = colors_u.view(dtype=np.uint8).reshape((count, 4))
         colors = colors_bytes.astype(np.float32) / 255.0
         
         if count > 0:
             avg_color = np.mean(colors, axis=0)
+            print(f"Debug: First Raw Color Uint32: {colors_u[0]}")
+            print(f"Debug: First Color Float: {colors[0]}")
             print(f"Debug: Loaded {count} colors. Average RGBA: {avg_color}")
         
-        # Scale
         scale_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'scale'), None)
         if scale_meta:
             s_min = np.array(scale_meta['min'], dtype=np.float32)
@@ -162,20 +191,10 @@ class LCCParser:
         scales_norm = scales_u.astype(np.float32) / 65535.0
         scales = s_min + scales_norm * (s_max - s_min)
         
-        # Rotation
         quats_np = decode_rotation(rots_u)
         
-        # Euler conversion (simplified loop for reliability)
-        # Can be vectorized further, but kept simple for stability in this debug version
         print("Converting rotations to Euler...")
-        eulers = np.zeros((count, 3), dtype=np.float32)
-        for i in range(count):
-            x, y, z, w = quats_np[i]
-            q = Quaternion((w, x, y, z))
-            e = q.to_euler()
-            eulers[i, 0] = e.x
-            eulers[i, 1] = e.y
-            eulers[i, 2] = e.z
+        eulers = quaternion_to_euler_numpy(quats_np)
             
         return colors, scales, eulers
 
@@ -190,26 +209,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     
-    # Import Options
-    lod_min: bpy.props.IntProperty(
-        name="Min LOD", 
-        default=0, 
-        min=0, 
-        max=5
-    )
-    lod_max: bpy.props.IntProperty(
-        name="Max LOD", 
-        default=3, 
-        min=0, 
-        max=8
-    )
-    skip_step: bpy.props.IntProperty(
-        name="Skip Step", 
-        default=1, 
-        min=1, 
-        max=100,
-        description="Reduce memory by loading every Nth point"
-    )
+    lod_min: bpy.props.IntProperty(name="Min LOD", default=0, min=0, max=5)
+    lod_max: bpy.props.IntProperty(name="Max LOD", default=3, min=0, max=8)
     
     scale_density: bpy.props.FloatProperty(name="Scale Multiplier", default=1.5, min=0.1)
     min_thickness: bpy.props.FloatProperty(name="Min Thickness", default=0.05, min=0.0)
@@ -220,28 +221,26 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         if not self.filepath.lower().endswith(".lcc"):
             self.report({'ERROR'}, "Please select an .lcc file.")
             return {'CANCELLED'}
+            
+        self.cleanup_old_objects()
 
         parser = LCCParser(self.filepath)
         
+        target_lod_start = self.lod_min
+        target_lod_end = self.lod_max
+
         all_pos, all_col, all_scl, all_rot, all_lod = [], [], [], [], []
         
-        start_lod = min(self.lod_min, self.lod_max)
-        end_lod = max(self.lod_min, self.lod_max)
-        skip = self.skip_step
+        start_lod = min(target_lod_start, target_lod_end)
+        end_lod = max(target_lod_start, target_lod_end)
         total_points = 0
         
         try:
             for lvl in range(start_lod, end_lod + 1):
                 units = parser.get_lod_info(lvl)
                 if not units: continue
+                # No skipping
                 p, c, s, r = parser.read_splat_data(units)
-                
-                # Apply Downsampling
-                if skip > 1:
-                    p = p[::skip]
-                    c = c[::skip]
-                    s = s[::skip]
-                    r = r[::skip]
                 
                 c_dec, s_dec, r_dec = parser.decode_attributes(c, s, r)
                 all_pos.append(p)
@@ -252,29 +251,26 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 count = len(p)
                 all_lod.append(np.full(count, lvl, dtype=np.int32))
                 total_points += count
-                print(f"Loaded LOD {lvl} (skip={skip}): {count} points")
+                print(f"Loaded LOD {lvl}: {count} points")
                 
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {'CANCELLED'}
 
         if total_points == 0:
             self.report({'WARNING'}, "No data loaded.")
             return {'CANCELLED'}
 
-        # Concatenate & Enforce Float32 for Blender
-        # IMPORTANT: ascontiguousarray ensures memory layout is correct for foreach_set
         final_pos = np.ascontiguousarray(np.concatenate(all_pos), dtype=np.float32)
         final_col = np.ascontiguousarray(np.concatenate(all_col), dtype=np.float32)
         final_scl = np.ascontiguousarray(np.concatenate(all_scl), dtype=np.float32)
         final_rot = np.ascontiguousarray(np.concatenate(all_rot), dtype=np.float32)
         final_lod = np.ascontiguousarray(np.concatenate(all_lod), dtype=np.int32)
 
-        # DEBUG: Verify data integrity
         print(f"--- DATA DEBUG ---")
-        print(f"First Position: {final_pos[0]}")
-        print(f"First Color: {final_col[0]}") # If this is [0,0,0,0], source is empty
-        print(f"Total Color Size: {final_col.size} floats")
+        print(f"First Color: {final_col[0]}") 
 
         mesh_name = "LCC_Splats"
         mesh = bpy.data.meshes.new(mesh_name)
@@ -284,8 +280,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         mesh.vertices.add(total_points)
         mesh.vertices.foreach_set("co", final_pos.flatten())
         
-        # Attributes - Using "LCC_Color" to avoid naming conflicts
-        color_attr = mesh.attributes.new(name="LCC_Color", type='FLOAT_COLOR', domain='POINT')
+        color_attr = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
         color_attr.data.foreach_set("color", final_col.flatten())
 
         scale_attr = mesh.attributes.new(name="SplatScale", type='FLOAT_VECTOR', domain='POINT')
@@ -308,6 +303,11 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         self.report({'INFO'}, f"Imported {total_points} splats.")
         return {'FINISHED'}
 
+    def cleanup_old_objects(self):
+        for obj in bpy.data.objects:
+            if "LCC_Splats" in obj.name:
+                bpy.data.objects.remove(obj, do_unlink=True)
+
     def create_geonodes(self, obj, density, thickness, lod_dist_factor):
         modifier = obj.modifiers.new(name="LCCSplatRenderer", type='NODES')
         node_group = bpy.data.node_groups.new("LCC_GN", "GeometryNodeTree")
@@ -320,34 +320,60 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         links = node_group.links
         for n in nodes: nodes.remove(n)
 
-        # Nodes
         input_node = nodes.new('NodeGroupInput')
-        input_node.location = (-1200, 0)
+        input_node.location = (-1400, 0)
         output_node = nodes.new('NodeGroupOutput')
-        output_node.location = (1200, 0)
+        output_node.location = (1400, 0)
 
-        # Attributes
+        # --- VIEWPORT OPTIMIZATION ---
+        is_viewport = nodes.new('GeometryNodeIsViewport')
+        is_viewport.location = (-1200, 200)
+        
+        viewport_ratio = nodes.new('FunctionNodeRandomValue')
+        viewport_ratio.data_type = 'BOOLEAN'
+        viewport_ratio.inputs['Probability'].default_value = 0.1
+        viewport_ratio.location = (-1200, 100)
+        
+        logic_not_viewport = nodes.new('FunctionNodeBooleanMath')
+        logic_not_viewport.operation = 'NOT'
+        logic_not_viewport.location = (-1000, 200)
+        links.new(is_viewport.outputs[0], logic_not_viewport.inputs[0])
+        
+        logic_or = nodes.new('FunctionNodeBooleanMath')
+        logic_or.operation = 'OR'
+        logic_or.location = (-800, 150)
+        links.new(logic_not_viewport.outputs[0], logic_or.inputs[0])
+        links.new(viewport_ratio.outputs[3], logic_or.inputs[1])
+        
+        separate_geo = nodes.new('GeometryNodeSeparateGeometry')
+        separate_geo.location = (-600, 0)
+        links.new(input_node.outputs['Geometry'], separate_geo.inputs['Geometry'])
+        links.new(logic_or.outputs[0], separate_geo.inputs['Selection'])
+        
+        current_geo = separate_geo.outputs['Selection']
+
+        # --- Attributes ---
         scale_read = nodes.new('GeometryNodeInputNamedAttribute')
         scale_read.data_type = 'FLOAT_VECTOR'
         scale_read.inputs['Name'].default_value = "SplatScale"
-        scale_read.location = (-1000, 100)
+        scale_read.location = (-1000, -100)
         
         rot_read = nodes.new('GeometryNodeInputNamedAttribute')
         rot_read.data_type = 'FLOAT_VECTOR'
         rot_read.inputs['Name'].default_value = "SplatRotation"
-        rot_read.location = (-1000, 0)
+        rot_read.location = (-1000, -200)
 
         color_read = nodes.new('GeometryNodeInputNamedAttribute')
         color_read.data_type = 'FLOAT_COLOR'
-        color_read.inputs['Name'].default_value = "LCC_Color" # Updated Name
-        color_read.location = (-1000, -100)
+        color_read.inputs['Name'].default_value = "SplatColor"
+        color_read.location = (-1000, -300)
         
         lod_read = nodes.new('GeometryNodeInputNamedAttribute')
         lod_read.data_type = 'INT'
         lod_read.inputs['Name'].default_value = "SplatLOD"
-        lod_read.location = (-1000, 300)
+        lod_read.location = (-1000, -400)
 
-        # LOD Logic
+        # --- LOD Logic ---
         pos_node = nodes.new('GeometryNodeInputPosition')
         pos_node.location = (-1000, 500)
         
@@ -391,7 +417,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         links.new(rand_val.outputs['Value'], math_compare.inputs['A'])
         links.new(math_div.outputs[0], math_compare.inputs['B'])
 
-        # Scale Logic
+        # --- Scale Logic ---
         scale_boost = nodes.new('ShaderNodeVectorMath')
         scale_boost.operation = 'SCALE'
         scale_boost.inputs[3].default_value = density
@@ -404,29 +430,33 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         scale_clamp.location = (-400, 100)
         links.new(scale_boost.outputs['Vector'], scale_clamp.inputs[0])
 
-        # Instancing
+        # --- Instancing ---
         instance_on_points = nodes.new('GeometryNodeInstanceOnPoints')
         instance_on_points.location = (-200, 0)
+        links.new(current_geo, instance_on_points.inputs['Points'])
         links.new(math_compare.outputs['Result'], instance_on_points.inputs['Selection'])
         
-        sphere_node = nodes.new('GeometryNodeMeshIcoSphere')
-        sphere_node.inputs['Radius'].default_value = 1.0 
-        sphere_node.inputs['Subdivisions'].default_value = 1
-        sphere_node.location = (-400, -200)
+        cube_node = nodes.new('GeometryNodeMeshCube')
+        cube_node.inputs['Size'].default_value = (2.0, 2.0, 2.0) 
+        cube_node.location = (-400, -200)
+        links.new(cube_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
 
+        links.new(scale_clamp.outputs['Vector'], instance_on_points.inputs['Scale'])
+        links.new(rot_read.outputs['Attribute'], instance_on_points.inputs['Rotation'])
+        
         store_color = nodes.new('GeometryNodeStoreNamedAttribute')
         store_color.data_type = 'FLOAT_COLOR'
         store_color.domain = 'INSTANCE'
         store_color.inputs['Name'].default_value = "viz_color"
         store_color.location = (0, 0)
-
-        realize_instances = nodes.new('GeometryNodeRealizeInstances')
-        realize_instances.location = (200, 0)
-
-        mat_node = nodes.new('GeometryNodeSetMaterial')
-        mat_node.location = (400, 0)
         
+        links.new(instance_on_points.outputs['Instances'], store_color.inputs['Geometry'])
+        links.new(color_read.outputs['Attribute'], store_color.inputs['Value'])
+
         # Material
+        mat_node = nodes.new('GeometryNodeSetMaterial')
+        mat_node.location = (200, 0)
+        
         mat_name = "GaussianSplatMat"
         if mat_name in bpy.data.materials:
             bpy.data.materials.remove(bpy.data.materials[mat_name])
@@ -442,6 +472,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         out_node.location = (800, 0)
         
         attr_node = nt.nodes.new('ShaderNodeAttribute')
+        attr_node.attribute_type = 'INSTANCER' 
         attr_node.attribute_name = "viz_color" 
         attr_node.location = (-800, 0)
         
@@ -500,23 +531,22 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         nt.links.new(mix_shader.outputs['Shader'], out_node.inputs['Surface'])
         mat_node.inputs['Material'].default_value = mat
         
-        # Linking
-        links.new(input_node.outputs['Geometry'], instance_on_points.inputs['Points'])
-        links.new(sphere_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
-        links.new(scale_clamp.outputs['Vector'], instance_on_points.inputs['Scale'])
-        links.new(rot_read.outputs['Attribute'], instance_on_points.inputs['Rotation'])
-        links.new(instance_on_points.outputs['Instances'], store_color.inputs['Geometry'])
-        links.new(color_read.outputs['Attribute'], store_color.inputs['Value'])
-        links.new(store_color.outputs['Geometry'], realize_instances.inputs['Geometry'])
-        links.new(realize_instances.outputs['Geometry'], mat_node.inputs['Geometry'])
+        links.new(store_color.outputs['Geometry'], mat_node.inputs['Geometry'])
         links.new(mat_node.outputs['Geometry'], output_node.inputs['Geometry'])
 
     def setup_360_camera(self):
         bpy.context.scene.render.engine = 'CYCLES'
-        cam_data = bpy.data.cameras.new("PanoramaCam")
-        cam_obj = bpy.data.objects.new("PanoramaCam", cam_data)
-        bpy.context.collection.objects.link(cam_obj)
-        bpy.context.scene.camera = cam_obj
+        
+        cam_name = "PanoramaCam"
+        if cam_name not in bpy.data.objects:
+            cam_data = bpy.data.cameras.new(cam_name)
+            cam_obj = bpy.data.objects.new(cam_name, cam_data)
+            bpy.context.collection.objects.link(cam_obj)
+            bpy.context.scene.camera = cam_obj
+        else:
+            cam_obj = bpy.data.objects[cam_name]
+            cam_data = cam_obj.data
+            
         cam_data.type = 'PANO'
         cam_data.panorama_type = 'EQUIRECTANGULAR'
         bpy.context.scene.render.resolution_x = 4096
@@ -545,7 +575,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 class LCC_PT_Panel(bpy.types.Panel):
-    bl_label = "LCC Tools"
+    bl_label = "LCC Tools3"
     bl_idname = "LCC_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
