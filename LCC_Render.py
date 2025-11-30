@@ -97,7 +97,6 @@ class LCCParser:
         with open(index_path, 'rb') as f:
             for i in range(num_units):
                 data = f.read(unit_entry_size)
-                # Parse unit data for the specific LOD level
                 base_off = 4 + lod_level * 16
                 
                 count = struct.unpack_from('<I', data, base_off)[0]
@@ -136,7 +135,6 @@ class LCCParser:
                 chunk_data = np.frombuffer(raw_bytes[:count*32], dtype=np.uint8)
                 chunk_matrix = chunk_data.reshape((count, 32))
                 
-                # Copy data to ensure contiguous memory layout
                 pos_raw = chunk_matrix[:, 0:12].copy()
                 pos_data = pos_raw.view(dtype=np.float32).reshape(count, 3)
                 
@@ -196,98 +194,35 @@ class LCCParser:
         return colors, scales, eulers
 
 # ------------------------------------------------------------------------
-# Frustum Culling Logic
-# ------------------------------------------------------------------------
-
-def update_frustum_culling(scene):
-    cam = scene.camera
-    if not cam: return
-    
-    # Only run if we have imported chunks
-    if "LCC_Imported" not in bpy.data.collections:
-        return
-        
-    chunks = [obj for obj in bpy.data.collections["LCC_Imported"].objects if obj.type == 'MESH']
-    if not chunks: return
-
-    for obj in chunks:
-        # Simple check: project object location to camera view
-        # This assumes the chunk's origin is somewhat central or indicative.
-        # For better accuracy, one might check bounding box corners.
-        co = obj.location
-        co_ndc = world_to_camera_view(scene, cam, co)
-        
-        # Check if within 0..1 range (with some margin) and in front of camera (z > 0)
-        margin = 0.2 
-        visible = (
-            -margin <= co_ndc.x <= 1.0 + margin and
-            -margin <= co_ndc.y <= 1.0 + margin and
-            co_ndc.z > 0
-        )
-        
-        # Also check distance for far clipping
-        if visible and co_ndc.z > cam.data.clip_end:
-            visible = False
-            
-        obj.hide_viewport = not visible
-
-# ------------------------------------------------------------------------
 # Blender Operator
 # ------------------------------------------------------------------------
 
 class IMPORT_OT_lcc(bpy.types.Operator):
     bl_idname = "import_scene.lcc"
-    bl_label = "Import LCC (Chunked + Culling)"
+    bl_label = "Import LCC (Split View/Render)"
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     
     lod_min: bpy.props.IntProperty(name="Min LOD", default=0, min=0, max=5)
-    lod_max: bpy.props.IntProperty(name="Max LOD", default=3, min=0, max=8)
+    lod_max: bpy.props.IntProperty(name="Max LOD", default=0, min=0, max=8)
+    
     scale_density: bpy.props.FloatProperty(name="Scale Multiplier", default=1.5, min=0.1)
     min_thickness: bpy.props.FloatProperty(name="Min Thickness", default=0.05, min=0.0)
-    lod_distance: bpy.props.FloatProperty(name="LOD Distance", default=20.0, min=1.0)
+    
+    lod_distance: bpy.props.FloatProperty(name="Render Distance", default=100.0, min=1.0, description="Points within this distance will be fully rendered")
+    
+    # Determines how much data is sampled for the viewport proxy object
+    viewport_density: bpy.props.FloatProperty(
+        name="Viewport Density (%)", 
+        default=10.0, 
+        min=0.1, 
+        max=100.0, 
+        description="Percentage of points to use for the unified viewport proxy object"
+    )
+    
     setup_render: bpy.props.BoolProperty(name="Setup 360 Render", default=True)
-
-    def create_chunk_object(self, context, chunk_id, positions, colors, scales, rots):
-        """
-        Creates a Mesh object for a chunk of data (vertices only).
-        """
-        mesh_name = f"LCC_Chunk_{chunk_id}"
-        mesh = bpy.data.meshes.new(name=mesh_name)
-        
-        num_points = len(positions)
-        mesh.vertices.add(num_points)
-        
-        # Set coordinates
-        mesh.vertices.foreach_set("co", positions.flatten())
-        
-        # Set attributes
-        attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
-        attr_col.data.foreach_set("color", colors.flatten())
-        
-        attr_scl = mesh.attributes.new(name="SplatScale", type='FLOAT_VECTOR', domain='POINT')
-        attr_scl.data.foreach_set("vector", scales.flatten())
-        
-        attr_rot = mesh.attributes.new(name="SplatRotation", type='FLOAT_VECTOR', domain='POINT')
-        attr_rot.data.foreach_set("vector", rots.flatten())
-        
-        # Create object
-        obj = bpy.data.objects.new(mesh_name, mesh)
-        
-        # Link to collection
-        if "LCC_Imported" not in bpy.data.collections:
-            coll = bpy.data.collections.new("LCC_Imported")
-            context.scene.collection.children.link(coll)
-        else:
-            coll = bpy.data.collections["LCC_Imported"]
-            
-        coll.objects.link(obj)
-        
-        # Apply Geometry Nodes
-        self.create_geonodes(obj, self.scale_density, self.min_thickness, self.lod_distance)
-        
-        return obj
+    show_bounds: bpy.props.BoolProperty(name="Show Bounds", default=True)
 
     def execute(self, context):
         if not self.filepath.lower().endswith(".lcc"):
@@ -295,6 +230,34 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             return {'CANCELLED'}
             
         self.cleanup_old_objects()
+        
+        # Collections setup
+        render_coll_name = "LCC_Render"
+        viewport_coll_name = "LCC_Viewport"
+        
+        if render_coll_name not in bpy.data.collections:
+            render_coll = bpy.data.collections.new(render_coll_name)
+            context.scene.collection.children.link(render_coll)
+        else:
+            render_coll = bpy.data.collections[render_coll_name]
+            
+        if viewport_coll_name not in bpy.data.collections:
+            viewport_coll = bpy.data.collections.new(viewport_coll_name)
+            context.scene.collection.children.link(viewport_coll)
+        else:
+            viewport_coll = bpy.data.collections[viewport_coll_name]
+
+        # Camera setup
+        if self.setup_render:
+            self.setup_360_camera()
+            self.optimize_cycles_for_transparency()
+            if context.scene.camera:
+                context.scene.camera.data.clip_end = 10000.0
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        for space in area.spaces:
+                            if space.type == 'VIEW_3D':
+                                space.clip_end = 10000.0
 
         parser = LCCParser(self.filepath)
         
@@ -307,30 +270,54 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         total_points = 0
         chunk_id = 0
         
+        # Buffer for Viewport Object (Unified)
+        vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list = [], [], [], []
+        
         try:
-            # Collect all units first to pass to iter_chunks
-            all_units = []
             for lvl in range(start_lod, end_lod + 1):
                 units = parser.get_lod_info(lvl)
-                if units:
-                    all_units.extend(units)
+                if not units: continue
+                
+                for pos, col_u, scl_u, rot_u in parser.iter_chunks(units, batch_size=1000000):
+                    # Decode
+                    col, scl, rot = parser.decode_attributes(col_u, scl_u, rot_u)
+                    
+                    # 1. Create Render Chunk (Full Resolution, Hidden in Viewport)
+                    self.create_render_chunk(render_coll, chunk_id, pos, col, scl, rot, lvl)
+                    
+                    # 2. Collect data for Viewport Proxy (Downsampled via Python)
+                    # Sampling logic to avoid memory explosion for viewport object
+                    sample_rate = self.viewport_density / 100.0
+                    if sample_rate < 1.0:
+                        # Create a boolean mask for sampling
+                        count = len(pos)
+                        mask = np.random.rand(count) < sample_rate
+                        if np.any(mask):
+                            vp_pos_list.append(pos[mask])
+                            vp_col_list.append(col[mask])
+                            vp_scl_list.append(scl[mask])
+                            vp_rot_list.append(rot[mask])
+                    else:
+                        vp_pos_list.append(pos)
+                        vp_col_list.append(col)
+                        vp_scl_list.append(scl)
+                        vp_rot_list.append(rot)
+                    
+                    count = len(pos)
+                    total_points += count
+                    print(f"Processed Chunk {chunk_id} (LOD {lvl}): {count} points")
+                    chunk_id += 1
             
-            if not all_units:
-                self.report({'WARNING'}, "No data found for selected LODs.")
-                return {'CANCELLED'}
-
-            # Iterate chunks
-            for pos, col_u, scl_u, rot_u in parser.iter_chunks(all_units, batch_size=1000000):
-                # Decode attributes for this chunk
-                col, scl, rot = parser.decode_attributes(col_u, scl_u, rot_u)
+            # Create Unified Viewport Object
+            if vp_pos_list:
+                print("Creating Unified Viewport Proxy Object...")
+                vp_pos = np.concatenate(vp_pos_list)
+                vp_col = np.concatenate(vp_col_list)
+                vp_scl = np.concatenate(vp_scl_list)
+                vp_rot = np.concatenate(vp_rot_list)
                 
-                # Create object
-                self.create_chunk_object(context, chunk_id, pos, col, scl, rot)
-                
-                count = len(pos)
-                total_points += count
-                print(f"Created Chunk {chunk_id}: {count} points")
-                chunk_id += 1
+                self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_rot)
+                print(f"Viewport Proxy Created: {len(vp_pos)} points.")
                 
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
@@ -341,39 +328,161 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         if total_points == 0:
             self.report({'WARNING'}, "No data loaded.")
             return {'CANCELLED'}
-
-        if self.setup_render:
-            self.setup_360_camera()
-            self.optimize_cycles_for_transparency()
             
-        self.report({'INFO'}, f"Imported {total_points} splats in {chunk_id} chunks.")
+        self.report({'INFO'}, f"Imported {total_points} splats. {chunk_id} Render chunks, 1 Viewport proxy.")
         return {'FINISHED'}
 
-    def cleanup_old_objects(self):
-        for obj in bpy.data.objects:
-            if "LCC_Splats" in obj.name or "LCC_Chunk_" in obj.name:
-                bpy.data.objects.remove(obj, do_unlink=True)
+    def create_render_chunk(self, collection, chunk_id, positions, colors, scales, rots, lod_level):
+        """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
+        mesh_name = f"LCC_Render_Chunk_{chunk_id}"
+        mesh = bpy.data.meshes.new(name=mesh_name)
         
-        # Clean up collection if empty
-        if "LCC_Imported" in bpy.data.collections:
-            coll = bpy.data.collections["LCC_Imported"]
-            if not coll.objects:
-                bpy.data.collections.remove(coll)
+        num_points = len(positions)
+        mesh.vertices.add(num_points)
+        mesh.vertices.foreach_set("co", positions.flatten())
+        
+        self._add_attributes(mesh, colors, scales, rots, lod_level)
+        
+        obj = bpy.data.objects.new(mesh_name, mesh)
+        collection.objects.link(obj)
+        
+        # Settings for RENDER object
+        obj.hide_viewport = True  # Hidden in viewport
+        obj.hide_render = False   # Visible in render
+        
+        # Bounding Box Display (optional, good for debugging invisible objects)
+        if self.show_bounds:
+            obj.show_bounds = True
+            obj.display_type = 'BOUNDS' 
+        
+        # Apply RENDER Geometry Nodes (LOD Logic)
+        self.create_render_geonodes(obj, self.scale_density, self.min_thickness, self.lod_distance)
 
-    def create_geonodes(self, obj, density, thickness, lod_dist_factor):
-        modifier = obj.modifiers.new(name="LCCSplatRenderer", type='NODES')
+    def create_viewport_object(self, collection, positions, colors, scales, rots):
+        """Creates a unified object for VIEWPORT ONLY (Hidden in Render)"""
+        mesh_name = "LCC_Viewport_Proxy"
+        mesh = bpy.data.meshes.new(name=mesh_name)
         
-        # Check if node group exists to reuse it (optimization)
-        group_name = "LCC_GN"
+        num_points = len(positions)
+        mesh.vertices.add(num_points)
+        mesh.vertices.foreach_set("co", positions.flatten())
+        
+        # Viewport proxy doesn't need LOD level attribute essentially, but keeping structure
+        self._add_attributes(mesh, colors, scales, rots, 0)
+        
+        obj = bpy.data.objects.new(mesh_name, mesh)
+        collection.objects.link(obj)
+        
+        # Settings for VIEWPORT object
+        obj.hide_viewport = False # Visible in viewport
+        obj.hide_render = True    # Hidden in render
+        
+        # Apply VIEWPORT Geometry Nodes (Simple Display)
+        self.create_viewport_geonodes(obj, self.scale_density, self.min_thickness)
+
+    def _add_attributes(self, mesh, colors, scales, rots, lod_level):
+        attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
+        attr_col.data.foreach_set("color", colors.flatten())
+        
+        attr_scl = mesh.attributes.new(name="SplatScale", type='FLOAT_VECTOR', domain='POINT')
+        attr_scl.data.foreach_set("vector", scales.flatten())
+        
+        attr_rot = mesh.attributes.new(name="SplatRotation", type='FLOAT_VECTOR', domain='POINT')
+        attr_rot.data.foreach_set("vector", rots.flatten())
+        
+        attr_lod = mesh.attributes.new(name="SplatLOD", type='INT', domain='POINT')
+        lod_data = np.full(len(mesh.vertices), lod_level, dtype=np.int32)
+        attr_lod.data.foreach_set("value", lod_data)
+
+    def cleanup_old_objects(self):
+        # Cleanup objects and collections
+        collections_to_remove = ["LCC_Render", "LCC_Viewport", "LCC_Imported"]
+        
+        for col_name in collections_to_remove:
+            if col_name in bpy.data.collections:
+                coll = bpy.data.collections[col_name]
+                for obj in coll.objects:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.collections.remove(coll)
+                
+        # Also cleanup by name pattern just in case
+        for obj in bpy.data.objects:
+            if "LCC_Render_Chunk" in obj.name or "LCC_Viewport_Proxy" in obj.name:
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+    # --- GEOMETRY NODES FOR RENDER (With LOD Culling) ---
+    def create_render_geonodes(self, obj, density, thickness, render_dist):
+        modifier = obj.modifiers.new(name="LCCSplatRenderer", type='NODES')
+        group_name = "LCC_GN_Render"
+        
         if group_name in bpy.data.node_groups:
             node_group = bpy.data.node_groups[group_name]
+            self._build_render_geonodes_tree(node_group, density, thickness, render_dist)
         else:
             node_group = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
-            self._build_geonodes_tree(node_group, density, thickness, lod_dist_factor)
+            self._build_render_geonodes_tree(node_group, density, thickness, render_dist)
+            
+        modifier.node_group = node_group
+        
+        target_cam = bpy.data.objects.get("PanoramaCam")
+        if not target_cam: target_cam = bpy.context.scene.camera
+        if "Camera" in modifier.keys(): modifier["Camera"] = target_cam
+
+    def _build_render_geonodes_tree(self, node_group, density, thickness, render_dist):
+        self._clear_interface(node_group)
+        node_group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+        node_group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+        node_group.interface.new_socket(name="Camera", in_out='INPUT', socket_type='NodeSocketObject')
+
+        nodes = node_group.nodes
+        links = node_group.links
+        for n in nodes: nodes.remove(n)
+
+        input_node = nodes.new('NodeGroupInput')
+        input_node.location = (-1800, 0)
+        output_node = nodes.new('NodeGroupOutput')
+        output_node.location = (1000, 0)
+
+        # --- LOD Distance Logic ---
+        pos_node = nodes.new('GeometryNodeInputPosition')
+        pos_node.location = (-1000, 500)
+        
+        cam_info = nodes.new('GeometryNodeObjectInfo')
+        cam_info.transform_space = 'RELATIVE' 
+        cam_info.location = (-1000, 600)
+        links.new(input_node.outputs['Camera'], cam_info.inputs[0])
+        
+        dist_node = nodes.new('ShaderNodeVectorMath')
+        dist_node.operation = 'DISTANCE'
+        dist_node.location = (-800, 500)
+        links.new(pos_node.outputs['Position'], dist_node.inputs[0])
+        links.new(cam_info.outputs['Location'], dist_node.inputs[1])
+        
+        render_compare = nodes.new('FunctionNodeCompare')
+        render_compare.data_type = 'FLOAT'
+        render_compare.operation = 'LESS_THAN'
+        render_compare.inputs['B'].default_value = render_dist
+        render_compare.location = (-600, 500)
+        links.new(dist_node.outputs[0], render_compare.inputs['A'])
+
+        self._build_instancing_part(nodes, links, input_node, output_node, render_compare.outputs[0], density, thickness)
+
+    # --- GEOMETRY NODES FOR VIEWPORT (Simple Display) ---
+    def create_viewport_geonodes(self, obj, density, thickness):
+        modifier = obj.modifiers.new(name="LCCSplatViewport", type='NODES')
+        group_name = "LCC_GN_Viewport"
+        
+        if group_name in bpy.data.node_groups:
+            node_group = bpy.data.node_groups[group_name]
+            self._build_viewport_geonodes_tree(node_group, density, thickness)
+        else:
+            node_group = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+            self._build_viewport_geonodes_tree(node_group, density, thickness)
             
         modifier.node_group = node_group
 
-    def _build_geonodes_tree(self, node_group, density, thickness, lod_dist_factor):
+    def _build_viewport_geonodes_tree(self, node_group, density, thickness):
+        self._clear_interface(node_group)
         node_group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
         node_group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
 
@@ -382,38 +491,26 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         for n in nodes: nodes.remove(n)
 
         input_node = nodes.new('NodeGroupInput')
-        input_node.location = (-1400, 0)
+        input_node.location = (-1800, 0)
         output_node = nodes.new('NodeGroupOutput')
-        output_node.location = (1400, 0)
+        output_node.location = (1000, 0)
+        
+        # No filtering selection for viewport (show all in the proxy mesh)
+        self._build_instancing_part(nodes, links, input_node, output_node, None, density, thickness)
 
-        # --- VIEWPORT OPTIMIZATION ---
-        is_viewport = nodes.new('GeometryNodeIsViewport')
-        is_viewport.location = (-1200, 200)
-        
-        viewport_ratio = nodes.new('FunctionNodeRandomValue')
-        viewport_ratio.data_type = 'BOOLEAN'
-        viewport_ratio.inputs['Probability'].default_value = 0.1
-        viewport_ratio.location = (-1200, 100)
-        
-        logic_not_viewport = nodes.new('FunctionNodeBooleanMath')
-        logic_not_viewport.operation = 'NOT'
-        logic_not_viewport.location = (-1000, 200)
-        links.new(is_viewport.outputs[0], logic_not_viewport.inputs[0])
-        
-        logic_or = nodes.new('FunctionNodeBooleanMath')
-        logic_or.operation = 'OR'
-        logic_or.location = (-800, 150)
-        links.new(logic_not_viewport.outputs[0], logic_or.inputs[0])
-        links.new(viewport_ratio.outputs[3], logic_or.inputs[1])
-        
-        separate_geo = nodes.new('GeometryNodeSeparateGeometry')
-        separate_geo.location = (-600, 0)
-        links.new(input_node.outputs['Geometry'], separate_geo.inputs['Geometry'])
-        links.new(logic_or.outputs[0], separate_geo.inputs['Selection'])
-        
-        current_geo = separate_geo.outputs['Selection']
+    # --- SHARED HELPERS ---
+    def _clear_interface(self, node_group):
+        if hasattr(node_group, "interface"):
+             for item in list(node_group.interface.items_tree):
+                 node_group.interface.remove(item)
+        else:
+             node_group.inputs.clear()
+             node_group.outputs.clear()
 
-        # --- Attributes ---
+    def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness):
+        """Builds the core splat instancing logic shared by both Render and Viewport"""
+        
+        # Attributes
         scale_read = nodes.new('GeometryNodeInputNamedAttribute')
         scale_read.data_type = 'FLOAT_VECTOR'
         scale_read.inputs['Name'].default_value = "SplatScale"
@@ -428,57 +525,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         color_read.data_type = 'FLOAT_COLOR'
         color_read.inputs['Name'].default_value = "SplatColor"
         color_read.location = (-1000, -300)
-        
-        lod_read = nodes.new('GeometryNodeInputNamedAttribute')
-        lod_read.data_type = 'INT'
-        lod_read.inputs['Name'].default_value = "SplatLOD"
-        lod_read.location = (-1000, -400)
 
-        # --- LOD Logic ---
-        pos_node = nodes.new('GeometryNodeInputPosition')
-        pos_node.location = (-1000, 500)
-        
-        cam_info = nodes.new('GeometryNodeObjectInfo')
-        cam_info.inputs[0].default_value = bpy.data.objects.get("PanoramaCam") 
-        cam_info.transform_space = 'RELATIVE' 
-        cam_info.location = (-1000, 600)
-        
-        dist_node = nodes.new('ShaderNodeVectorMath')
-        dist_node.operation = 'DISTANCE'
-        dist_node.location = (-800, 500)
-        links.new(pos_node.outputs['Position'], dist_node.inputs[0])
-        links.new(cam_info.outputs['Location'], dist_node.inputs[1])
-        
-        math_pow = nodes.new('ShaderNodeMath')
-        math_pow.operation = 'POWER'
-        math_pow.inputs[0].default_value = 2.0
-        math_pow.location = (-800, 300)
-        links.new(lod_read.outputs['Attribute'], math_pow.inputs[1])
-        
-        math_mult_dist = nodes.new('ShaderNodeMath')
-        math_mult_dist.operation = 'MULTIPLY'
-        math_mult_dist.inputs[0].default_value = lod_dist_factor * 2.0
-        math_mult_dist.location = (-600, 300)
-        links.new(math_pow.outputs[0], math_mult_dist.inputs[1])
-        
-        rand_val = nodes.new('FunctionNodeRandomValue')
-        rand_val.data_type = 'FLOAT'
-        rand_val.location = (-600, 400)
-        
-        math_div = nodes.new('ShaderNodeMath')
-        math_div.operation = 'DIVIDE'
-        math_div.location = (-600, 500)
-        links.new(math_mult_dist.outputs[0], math_div.inputs[0]) 
-        links.new(dist_node.outputs[0], math_div.inputs[1]) 
-        
-        math_compare = nodes.new('FunctionNodeCompare')
-        math_compare.data_type = 'FLOAT'
-        math_compare.operation = 'LESS_THAN'
-        math_compare.location = (-400, 400)
-        links.new(rand_val.outputs['Value'], math_compare.inputs['A'])
-        links.new(math_div.outputs[0], math_compare.inputs['B'])
-
-        # --- Scale Logic ---
+        # Scale Logic
         scale_boost = nodes.new('ShaderNodeVectorMath')
         scale_boost.operation = 'SCALE'
         scale_boost.inputs[3].default_value = density
@@ -491,41 +539,53 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         scale_clamp.location = (-400, 100)
         links.new(scale_boost.outputs['Vector'], scale_clamp.inputs[0])
 
-        # --- Instancing ---
+        # Instancing
         instance_on_points = nodes.new('GeometryNodeInstanceOnPoints')
-        instance_on_points.location = (-200, 0)
-        links.new(current_geo, instance_on_points.inputs['Points'])
-        links.new(math_compare.outputs['Result'], instance_on_points.inputs['Selection'])
+        instance_on_points.location = (0, 0)
+        links.new(input_node.outputs['Geometry'], instance_on_points.inputs['Points'])
+        
+        if selection_socket:
+            links.new(selection_socket, instance_on_points.inputs['Selection'])
         
         cube_node = nodes.new('GeometryNodeMeshCube')
         cube_node.inputs['Size'].default_value = (2.0, 2.0, 2.0) 
-        cube_node.location = (-400, -200)
+        cube_node.location = (-200, -200)
         links.new(cube_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
 
         links.new(scale_clamp.outputs['Vector'], instance_on_points.inputs['Scale'])
         links.new(rot_read.outputs['Attribute'], instance_on_points.inputs['Rotation'])
         
+        # Store Color
         store_color = nodes.new('GeometryNodeStoreNamedAttribute')
         store_color.data_type = 'FLOAT_COLOR'
         store_color.domain = 'INSTANCE'
         store_color.inputs['Name'].default_value = "viz_color"
-        store_color.location = (0, 0)
+        store_color.location = (200, 0)
         
         links.new(instance_on_points.outputs['Instances'], store_color.inputs['Geometry'])
         links.new(color_read.outputs['Attribute'], store_color.inputs['Value'])
 
         # Material
         mat_node = nodes.new('GeometryNodeSetMaterial')
-        mat_node.location = (200, 0)
+        mat_node.location = (400, 0)
         
         mat_name = "GaussianSplatMat"
         if mat_name in bpy.data.materials:
-            bpy.data.materials.remove(bpy.data.materials[mat_name])
-        mat = bpy.data.materials.new(name=mat_name)
-        mat.use_nodes = True
-        mat.blend_method = 'HASHED'
-        if hasattr(mat, 'shadow_method'): mat.shadow_method = 'NONE'
+            # We don't remove material here to avoid recreating it for every chunk
+            mat = bpy.data.materials[mat_name]
+        else:
+            mat = bpy.data.materials.new(name=mat_name)
+            mat.use_nodes = True
+            mat.blend_method = 'HASHED'
+            if hasattr(mat, 'shadow_method'): mat.shadow_method = 'NONE'
+            self._create_shader_nodes(mat)
+            
+        mat_node.inputs['Material'].default_value = mat
         
+        links.new(store_color.outputs['Geometry'], mat_node.inputs['Geometry'])
+        links.new(mat_node.outputs['Geometry'], output_node.inputs['Geometry'])
+
+    def _create_shader_nodes(self, mat):
         nt = mat.node_tree
         for n in nt.nodes: nt.nodes.remove(n)
         
@@ -537,7 +597,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         attr_node.attribute_name = "viz_color" 
         attr_node.location = (-800, 0)
         
-        # Shader Graph
         tex_coord = nt.nodes.new('ShaderNodeTexCoord')
         tex_coord.location = (-800, 300)
         vec_math_dot = nt.nodes.new('ShaderNodeVectorMath')
@@ -590,14 +649,9 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         nt.links.new(emission.outputs['Emission'], mix_shader.inputs[2])
         
         nt.links.new(mix_shader.outputs['Shader'], out_node.inputs['Surface'])
-        mat_node.inputs['Material'].default_value = mat
-        
-        links.new(store_color.outputs['Geometry'], mat_node.inputs['Geometry'])
-        links.new(mat_node.outputs['Geometry'], output_node.inputs['Geometry'])
 
     def setup_360_camera(self):
         bpy.context.scene.render.engine = 'CYCLES'
-        
         cam_name = "PanoramaCam"
         if cam_name not in bpy.data.objects:
             cam_data = bpy.data.cameras.new(cam_name)
@@ -607,7 +661,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         else:
             cam_obj = bpy.data.objects[cam_name]
             cam_data = cam_obj.data
-            
         cam_data.type = 'PANO'
         cam_data.panorama_type = 'EQUIRECTANGULAR'
         bpy.context.scene.render.resolution_x = 4096
@@ -636,7 +689,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 class LCC_PT_Panel(bpy.types.Panel):
-    bl_label = "LCC Tools (Chunked + Culling)"
+    bl_label = "LCC Tools (Split View/Render)"
     bl_idname = "LCC_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -654,16 +707,10 @@ def register():
         except: pass
     for cls in classes:
         bpy.utils.register_class(cls)
-    
-    if update_frustum_culling not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(update_frustum_culling)
 
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
-    
-    if update_frustum_culling in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(update_frustum_culling)
 
 if __name__ == "__main__":
     register()
