@@ -215,7 +215,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     # Determines how much data is sampled for the viewport proxy object
     viewport_density: bpy.props.FloatProperty(
         name="Viewport Density (%)", 
-        default=10.0, 
+        default=1.0, 
         min=0.1, 
         max=100.0, 
         description="Percentage of points to use for the unified viewport proxy object"
@@ -465,7 +465,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         render_compare.location = (-600, 500)
         links.new(dist_node.outputs[0], render_compare.inputs['A'])
 
-        self._build_instancing_part(nodes, links, input_node, output_node, render_compare.outputs[0], density, thickness)
+        self._build_instancing_part(nodes, links, input_node, output_node, render_compare.outputs[0], density, thickness, high_detail=True)
 
     # --- GEOMETRY NODES FOR VIEWPORT (Simple Display) ---
     def create_viewport_geonodes(self, obj, density, thickness):
@@ -496,7 +496,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         output_node.location = (1000, 0)
         
         # No filtering selection for viewport (show all in the proxy mesh)
-        self._build_instancing_part(nodes, links, input_node, output_node, None, density, thickness)
+        self._build_instancing_part(nodes, links, input_node, output_node, None, density, thickness, high_detail=False)
 
     # --- SHARED HELPERS ---
     def _clear_interface(self, node_group):
@@ -507,7 +507,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
              node_group.inputs.clear()
              node_group.outputs.clear()
 
-    def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness):
+    def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness, high_detail=False):
         """Builds the core splat instancing logic shared by both Render and Viewport"""
         
         # Attributes
@@ -547,10 +547,18 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         if selection_socket:
             links.new(selection_socket, instance_on_points.inputs['Selection'])
         
-        cube_node = nodes.new('GeometryNodeMeshCube')
-        cube_node.inputs['Size'].default_value = (2.0, 2.0, 2.0) 
-        cube_node.location = (-200, -200)
-        links.new(cube_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
+        if high_detail:
+            # Use IcoSphere for better shape detail (Render)
+            mesh_node = nodes.new('GeometryNodeMeshIcoSphere')
+            mesh_node.inputs['Radius'].default_value = 1.0
+            mesh_node.inputs['Subdivisions'].default_value = 3
+        else:
+            # Use Cube for performance (Viewport)
+            mesh_node = nodes.new('GeometryNodeMeshCube')
+            mesh_node.inputs['Size'].default_value = (2.0, 2.0, 2.0)
+            
+        mesh_node.location = (-200, -200)
+        links.new(mesh_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
 
         links.new(scale_clamp.outputs['Vector'], instance_on_points.inputs['Scale'])
         links.new(rot_read.outputs['Attribute'], instance_on_points.inputs['Rotation'])
