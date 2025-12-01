@@ -492,19 +492,13 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
                 if should_sort:
                     glsl_renderer.sort_and_update(cam_pos)
-                    last_cam_pos = cam_pos.copy()
-                
-                # 3. Draw
-                glsl_renderer.draw()
-                
             except Exception as e:
-                # Prevent console flood on error
-                pass
-
+                self.report({'ERROR'}, f"Error in draw_callback: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                
     def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, hide_render_force=False):
-        """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
         mesh = bpy.data.meshes.new(name=chunk_name)
-        
         num_points = len(positions)
         mesh.vertices.add(num_points)
         mesh.vertices.foreach_set("co", positions.flatten())

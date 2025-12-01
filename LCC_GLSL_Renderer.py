@@ -5,7 +5,7 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 # --------------------------------------------------------------------
-# GLSL Shaders (3DGS EWA Splatting)
+# GLSL Shaders (3DGS EWA Splatting) - Texture Based Instancing
 # --------------------------------------------------------------------
 
 VERT_SHADER = """
@@ -15,10 +15,12 @@ uniform mat4 projectionMatrix;
 uniform vec2 viewportSize;
 uniform vec2 focal; // x, y
 
-in vec3 pos;          // Instance Attribute: Center
-in vec4 color;        // Instance Attribute: Color
-in vec3 scale;        // Instance Attribute: Scale
-in vec4 rot;          // Instance Attribute: Rotation (Quaternion)
+uniform sampler2D posTex;
+uniform sampler2D colorTex;
+uniform sampler2D scaleTex;
+uniform sampler2D rotTex;
+uniform int texWidth;
+
 in vec2 quad_pos;     // Vertex Attribute: Quad Coord
 
 out vec4 vColor;
@@ -38,6 +40,17 @@ mat3 quatToMat3(vec4 q) {
 }
 
 void main() {
+    // Fetch Instance Data from Textures
+    int id = gl_InstanceID;
+    int y = id / texWidth;
+    int x = id % texWidth;
+    ivec2 texCoord = ivec2(x, y);
+
+    vec3 pos = texelFetch(posTex, texCoord, 0).xyz;
+    vec4 color = texelFetch(colorTex, texCoord, 0);
+    vec3 scale = texelFetch(scaleTex, texCoord, 0).xyz;
+    vec4 rot = texelFetch(rotTex, texCoord, 0);
+
     vColor = color;
     vUv = quad_pos; // -1 to 1
 
@@ -69,12 +82,12 @@ void main() {
     // pos_cam.z is negative.
     
     float z = pos_cam.z;
-    float x = pos_cam.x;
-    float y = pos_cam.y;
+    float x_cam = pos_cam.x;
+    float y_cam = pos_cam.y;
     
     mat3 J = mat3(
-        focal.x / z, 0.0, -(focal.x * x) / (z * z),
-        0.0, focal.y / z, -(focal.y * y) / (z * z),
+        focal.x / z, 0.0, -(focal.x * x_cam) / (z * z),
+        0.0, focal.y / z, -(focal.y * y_cam) / (z * z),
         0.0, 0.0, 0.0
     );
     
@@ -160,34 +173,69 @@ void main() {
 class LCCGLSLRenderer:
     def __init__(self):
         self.shader = None
-        self.dummy_shader = None # Helper for batch creation
         self.batch = None
         self.num_instances = 0
+        
+        # Textures
+        self.pos_tex = None
+        self.col_tex = None
+        self.scl_tex = None
+        self.rot_tex = None
+        self.tex_width = 2048 # Fixed width for textures
+        
         self._setup_shader()
         
     def _setup_shader(self):
         try:
             self.shader = gpu.types.GPUShader(VERT_SHADER, FRAG_SHADER)
-            
-            # Dummy shader for batch creation (only knows about quad_pos)
-            dummy_vert = """
-            in vec2 quad_pos;
-            void main() { gl_Position = vec4(quad_pos, 0.0, 1.0); }
-            """
-            dummy_frag = """
-            out vec4 fragColor;
-            void main() { fragColor = vec4(1.0); }
-            """
-            self.dummy_shader = gpu.types.GPUShader(dummy_vert, dummy_frag)
-            
         except Exception as e:
             print(f"Shader Compilation Error: {e}")
             self.shader = None
-            self.dummy_shader = None
         
+    def _create_data_texture(self, data, width):
+        """
+        Creates a GPUTexture from numpy data.
+        Data must be float32.
+        Pads data to fit width * height.
+        Returns texture object.
+        """
+        num_items = len(data)
+        num_components = data.shape[1]
+        
+        height = (num_items + width - 1) // width
+        padded_size = width * height
+        
+        # Pad data
+        if num_items < padded_size:
+            padding = np.zeros((padded_size - num_items, num_components), dtype=np.float32)
+            data_padded = np.vstack([data, padding])
+        else:
+            data_padded = data
+            
+        # Ensure 4 components for RGBA32F
+        if num_components == 3:
+            # Add alpha channel (1.0 or 0.0 doesn't matter much for pos/scale, but 0 is safer)
+            alpha = np.zeros((padded_size, 1), dtype=np.float32)
+            data_final = np.hstack([data_padded, alpha])
+        else:
+            data_final = data_padded
+            
+        # Flatten
+        data_flat = data_final.flatten()
+        
+        # Create Buffer
+        # gpu.types.Buffer(type, size, data)
+        # type: 'FLOAT', 'INT', 'UINT', 'UCHAR'
+        # size: number of elements (not bytes)
+        gpu_buffer = gpu.types.Buffer('FLOAT', len(data_flat), data_flat)
+        
+        # Create Texture
+        tex = gpu.types.GPUTexture((width, height), format='RGBA32F', data=gpu_buffer)
+        return tex
+
     def load_data(self, pos, col, scl, rot):
         """
-        Loads data into GPU buffers.
+        Loads data into GPU Textures.
         Expects numpy arrays.
         """
         self.num_instances = len(pos)
@@ -195,93 +243,51 @@ class LCCGLSLRenderer:
             self.batch = None
             return
 
-        # Keep references for sorting
+        # Keep references for sorting (optional, not implemented for texture yet)
         self.original_pos = pos
         self.original_col = col
         self.original_scl = scl
         self.original_rot = rot
         
-        # Base Quad (Per Vertex)
+        # Create Textures
+        try:
+            self.pos_tex = self._create_data_texture(pos, self.tex_width)
+            self.col_tex = self._create_data_texture(col, self.tex_width)
+            self.scl_tex = self._create_data_texture(scl, self.tex_width)
+            self.rot_tex = self._create_data_texture(rot, self.tex_width)
+            print(f"Created Data Textures: {self.pos_tex.width}x{self.pos_tex.height} for {self.num_instances} instances.")
+        except Exception as e:
+            print(f"Failed to create data textures: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        # Create Batch (Quad Only)
         quad_verts = np.array([
             [-1.0, -1.0], [ 1.0, -1.0],
             [ 1.0,  1.0], [-1.0,  1.0]
         ], dtype=np.float32)
         
-        # 1. Create Quad VBO manually
         fmt_quad = gpu.types.GPUVertFormat()
         fmt_quad.attr_add(id="quad_pos", comp_type='F32', len=2, fetch_mode='FLOAT')
         vbo_quad = gpu.types.GPUVertBuf(len=len(quad_verts), format=fmt_quad)
         vbo_quad.attr_fill(id="quad_pos", data=quad_verts)
-
-        # 2. Create Instance VBO manually
-        fmt_inst = gpu.types.GPUVertFormat()
-        fmt_inst.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        fmt_inst.attr_add(id="color", comp_type='F32', len=4, fetch_mode='FLOAT')
-        fmt_inst.attr_add(id="scale", comp_type='F32', len=3, fetch_mode='FLOAT')
-        fmt_inst.attr_add(id="rot", comp_type='F32', len=4, fetch_mode='FLOAT')
-        self.vbo_inst = gpu.types.GPUVertBuf(len=len(pos), format=fmt_inst)
-        self.update_buffers(pos, col, scl, rot)
-
-        # 3. Create IBO manually (using list of tuples)
-        # It seems GPUIndexBuf expects the structure matching the type (TRIS -> list of 3-tuples)
+        
+        indices = [(0, 1, 2), (0, 2, 3)]
+        ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
+        
         try:
-            ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
-            print("DEBUG: GPUIndexBuf created successfully with list of tuples.")
+            self.batch = gpu.types.GPUBatch(type='TRIS', buf=vbo_quad, elem=ibo)
+            print("DEBUG: GPUBatch created successfully (Quad Only).")
         except Exception as e:
-            print(f"DEBUG: Failed to create GPUIndexBuf with tuples: {e}")
-            # Last ditch attempt: flat list? No, we tried that.
-            # What if we just don't use an IBO? (Not possible for Quad instancing usually unless we duplicate verts)
-            ibo = None
-
-        if ibo:
-            # 4. Create Final Batch with BOTH buffers
-            try:
-                self.batch = gpu.types.GPUBatch(type='TRIS', buf=[vbo_quad, self.vbo_inst], elem=ibo)
-                print("DEBUG: GPUBatch created successfully with VBO list.")
-            except Exception as e:
-                print(f"DEBUG: Failed to create GPUBatch with list: {e}")
-                self.batch = None
-        else:
-            print("Error: Could not create IBO.")
+            print(f"DEBUG: Failed to create GPUBatch: {e}")
+            self.batch = None
     
-    def update_buffers(self, pos, col, scl, rot):
-        """Update instance VBO with new (sorted) data"""
-        self.vbo_inst.attr_fill(id="pos", data=pos)
-        self.vbo_inst.attr_fill(id="color", data=col)
-        self.vbo_inst.attr_fill(id="scale", data=scl)
-        self.vbo_inst.attr_fill(id="rot", data=rot)
-
     def sort_and_update(self, cam_pos):
         """Sort instances back-to-front based on camera position"""
-        if self.num_instances == 0 or not hasattr(self, 'original_pos'):
-            return
-            
-        # 1. Calculate Squared Distances
-        # Note: In Blender, camera looks down -Z. 
-        # But for sorting simple euclidean distance is usually fine for splats.
-        # For strict 3DGS, we project to view vector, but distance is a good approximation.
-        
-        # Convert cam_pos to numpy
-        cam_p = np.array([cam_pos.x, cam_pos.y, cam_pos.z], dtype=np.float32)
-        
-        # Vector from camera to splat
-        diff = self.original_pos - cam_p
-        
-        # Squared distance (faster than norm)
-        dists = np.einsum('ij,ij->i', diff, diff)
-        
-        # 2. Argsort (Back-to-Front means furthest first -> Descending order)
-        # numpy argsort is ascending, so we take [::-1]
-        indices = np.argsort(dists)[::-1]
-        
-        # 3. Reorder Data
-        pos_sorted = self.original_pos[indices]
-        col_sorted = self.original_col[indices]
-        scl_sorted = self.original_scl[indices]
-        rot_sorted = self.original_rot[indices]
-        
-        # 4. Upload to GPU
-        self.update_buffers(pos_sorted, col_sorted, scl_sorted, rot_sorted)
+        # Sorting with textures requires re-uploading the textures.
+        # This can be expensive. Disabled for now.
+        pass
 
     def draw(self):
         if not self.batch or not self.shader:
@@ -300,9 +306,6 @@ class LCCGLSLRenderer:
         view_matrix = region_data.view_matrix
         projection_matrix = region_data.window_matrix
         
-        # Calculate Focal Length (fx, fy) from Projection Matrix
-        # OpenGL Projection: P[0][0] = 2n / (r-l) = 2 * focal_x / width
-        # focal_x = P[0][0] * width / 2
         width = region.width
         height = region.height
         
@@ -315,6 +318,22 @@ class LCCGLSLRenderer:
         self.shader.uniform_float("projectionMatrix", projection_matrix)
         self.shader.uniform_float("viewportSize", Vector((width, height)))
         self.shader.uniform_float("focal", Vector((fx, fy)))
+        self.shader.uniform_int("texWidth", self.tex_width)
+        
+        # Bind Textures
+        if self.pos_tex: self.shader.uniform_sampler("posTex", self.pos_tex)
+        if self.colorTex: self.shader.uniform_sampler("colorTex", self.col_tex)
+        if self.scaleTex: self.shader.uniform_sampler("scaleTex", self.scl_tex)
+        if self.rotTex: self.shader.uniform_sampler("rotTex", self.rot_tex)
         
         # Draw
         self.batch.draw_instanced(self.shader)
+
+    # Helper properties for uniform binding names (avoiding typos)
+    @property
+    def colorTex(self): return self.col_tex
+    @property
+    def scaleTex(self): return self.scl_tex
+    @property
+    def rotTex(self): return self.rot_tex
+
