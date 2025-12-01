@@ -210,6 +210,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     scale_density: bpy.props.FloatProperty(name="Scale Multiplier", default=1.5, min=0.1)
     min_thickness: bpy.props.FloatProperty(name="Min Thickness", default=0.05, min=0.0)
     
+    chunk_size: bpy.props.FloatProperty(name="Chunk Grid Size", default=10.0, min=1.0, description="Size of the grid cell for splitting render chunks")
+    
     lod_distance: bpy.props.FloatProperty(name="Render Distance", default=100.0, min=1.0, description="Points within this distance will be fully rendered")
     
     # Determines how much data is sampled for the viewport proxy object
@@ -268,11 +270,15 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         end_lod = max(target_lod_start, target_lod_end)
         
         total_points = 0
-        chunk_id = 0
         
         # Buffer for Viewport Object (Unified)
         vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list = [], [], [], []
         
+        # Spatial Grid Buffer for Render Chunks
+        # Key: (grid_x, grid_y, grid_z), Value: lists of (pos, col, scl, rot, lod)
+        spatial_chunks = {}
+        chunk_grid_size = self.chunk_size
+
         try:
             for lvl in range(start_lod, end_lod + 1):
                 units = parser.get_lod_info(lvl)
@@ -282,10 +288,31 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     # Decode
                     col, scl, rot = parser.decode_attributes(col_u, scl_u, rot_u)
                     
-                    # 1. Create Render Chunk (Full Resolution, Hidden in Viewport)
-                    self.create_render_chunk(render_coll, chunk_id, pos, col, scl, rot, lvl)
+                    # --- 1. Binning for Render Chunks (Grid Split) ---
+                    # Calculate grid indices for each point
+                    grid_indices = np.floor(pos / chunk_grid_size).astype(np.int32)
                     
-                    # 2. Collect data for Viewport Proxy (Downsampled via Python)
+                    # Unique grid keys in this batch
+                    unique_grids = np.unique(grid_indices, axis=0)
+                    
+                    for gx, gy, gz in unique_grids:
+                        # Mask for points in this grid cell
+                        mask = (grid_indices[:, 0] == gx) & (grid_indices[:, 1] == gy) & (grid_indices[:, 2] == gz)
+                        
+                        if not np.any(mask): continue
+                        
+                        key = (gx, gy, gz)
+                        if key not in spatial_chunks:
+                            spatial_chunks[key] = {'pos': [], 'col': [], 'scl': [], 'rot': [], 'lod': []}
+                        
+                        spatial_chunks[key]['pos'].append(pos[mask])
+                        spatial_chunks[key]['col'].append(col[mask])
+                        spatial_chunks[key]['scl'].append(scl[mask])
+                        spatial_chunks[key]['rot'].append(rot[mask])
+                        # Store LOD level for each point (since chunks can mix LODs now)
+                        spatial_chunks[key]['lod'].append(np.full(np.sum(mask), lvl, dtype=np.int32))
+
+                    # --- 2. Collect data for Viewport Proxy (Downsampled via Python) ---
                     # Sampling logic to avoid memory explosion for viewport object
                     sample_rate = self.viewport_density / 100.0
                     if sample_rate < 1.0:
@@ -305,9 +332,22 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     
                     count = len(pos)
                     total_points += count
-                    print(f"Processed Chunk {chunk_id} (LOD {lvl}): {count} points")
-                    chunk_id += 1
-            
+                    print(f"Processed Batch (LOD {lvl}): {count} points")
+
+            # Create Render Chunks from Spatial Grid
+            print(f"Creating {len(spatial_chunks)} Spatial Render Chunks...")
+            for key, data in spatial_chunks.items():
+                gx, gy, gz = key
+                chunk_name = f"LCC_Render_Chunk_{gx}_{gy}_{gz}"
+                
+                c_pos = np.concatenate(data['pos'])
+                c_col = np.concatenate(data['col'])
+                c_scl = np.concatenate(data['scl'])
+                c_rot = np.concatenate(data['rot'])
+                c_lod = np.concatenate(data['lod'])
+                
+                self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod)
+
             # Create Unified Viewport Object
             if vp_pos_list:
                 print("Creating Unified Viewport Proxy Object...")
@@ -329,21 +369,20 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             self.report({'WARNING'}, "No data loaded.")
             return {'CANCELLED'}
             
-        self.report({'INFO'}, f"Imported {total_points} splats. {chunk_id} Render chunks, 1 Viewport proxy.")
+        self.report({'INFO'}, f"Imported {total_points} splats. {len(spatial_chunks)} Render chunks, 1 Viewport proxy.")
         return {'FINISHED'}
 
-    def create_render_chunk(self, collection, chunk_id, positions, colors, scales, rots, lod_level):
+    def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels):
         """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
-        mesh_name = f"LCC_Render_Chunk_{chunk_id}"
-        mesh = bpy.data.meshes.new(name=mesh_name)
+        mesh = bpy.data.meshes.new(name=chunk_name)
         
         num_points = len(positions)
         mesh.vertices.add(num_points)
         mesh.vertices.foreach_set("co", positions.flatten())
         
-        self._add_attributes(mesh, colors, scales, rots, lod_level)
+        self._add_attributes(mesh, colors, scales, rots, lod_levels)
         
-        obj = bpy.data.objects.new(mesh_name, mesh)
+        obj = bpy.data.objects.new(chunk_name, mesh)
         collection.objects.link(obj)
         
         # Settings for RENDER object
@@ -380,7 +419,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         # Apply VIEWPORT Geometry Nodes (Simple Display)
         self.create_viewport_geonodes(obj, self.scale_density, self.min_thickness)
 
-    def _add_attributes(self, mesh, colors, scales, rots, lod_level):
+    def _add_attributes(self, mesh, colors, scales, rots, lod_data):
         attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
         attr_col.data.foreach_set("color", colors.flatten())
         
@@ -391,8 +430,14 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         attr_rot.data.foreach_set("vector", rots.flatten())
         
         attr_lod = mesh.attributes.new(name="SplatLOD", type='INT', domain='POINT')
-        lod_data = np.full(len(mesh.vertices), lod_level, dtype=np.int32)
-        attr_lod.data.foreach_set("value", lod_data)
+        
+        # Handle both single int (uniform LOD) and array (mixed LOD)
+        if isinstance(lod_data, int):
+             final_lod_data = np.full(len(mesh.vertices), lod_data, dtype=np.int32)
+        else:
+             final_lod_data = lod_data
+             
+        attr_lod.data.foreach_set("value", final_lod_data)
 
     def cleanup_old_objects(self):
         # Cleanup objects and collections
