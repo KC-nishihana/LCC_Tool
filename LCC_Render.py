@@ -4,8 +4,31 @@ import json
 import struct
 import numpy as np
 import math
+import sys
 from mathutils import Quaternion, Vector, Matrix
 from bpy_extras.object_utils import world_to_camera_view
+
+# Add current directory to sys.path to ensure local imports work
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
+try:
+    from LCC_GLSL_Renderer import LCCGLSLRenderer
+except ImportError:
+    # Fallback or handle error if file not found yet
+    print("Warning: LCC_GLSL_Renderer not found. GLSL rendering will be disabled.")
+    LCCGLSLRenderer = None
+
+# ------------------------------------------------------------------------
+# Globals for GLSL Renderer
+# ------------------------------------------------------------------------
+glsl_renderer = None
+draw_handler = None
+
+def update_view(scene, context):
+    # Callback to update sorting if needed
+    pass
 
 # ------------------------------------------------------------------------
 # LCC Decoding Logic
@@ -188,10 +211,14 @@ class LCCParser:
         scales_norm = scales_u.astype(np.float32) / 65535.0
         scales = s_min + scales_norm * (s_max - s_min)
         
+        # For GLSL, we keep rotations as Quaternions (or decode them).
+        # The decode_rotation function returns (x, y, z, w)
         quats_np = decode_rotation(rots_u)
+        
+        # We also return Eulers for the Mesh fallback/Render chunks
         eulers = quaternion_to_euler_numpy(quats_np)
             
-        return colors, scales, eulers
+        return colors, scales, quats_np, eulers
 
 # ------------------------------------------------------------------------
 # Blender Operator
@@ -219,14 +246,16 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     # Determines how much data is sampled for the viewport proxy object
     viewport_density: bpy.props.FloatProperty(
         name="Viewport Density (%)", 
-        default=1.0, 
+        default=10.0, 
         min=0.1, 
         max=100.0, 
-        description="Percentage of points to use for the unified viewport proxy object"
+        description="Percentage of points to use for the viewport GLSL renderer"
     )
     
     setup_render: bpy.props.BoolProperty(name="Setup 360 Render", default=True)
     show_bounds: bpy.props.BoolProperty(name="Show Bounds", default=True)
+    
+    use_glsl: bpy.props.BoolProperty(name="Use GLSL Viewport", default=True, description="Use high-performance OpenGL renderer for viewport")
 
     def execute(self, context):
         if not self.filepath.lower().endswith(".lcc"):
@@ -237,7 +266,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         # Collections setup
         render_coll_name = "LCC_Render"
-        viewport_coll_name = "LCC_Viewport"
         
         if render_coll_name not in bpy.data.collections:
             render_coll = bpy.data.collections.new(render_coll_name)
@@ -245,12 +273,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         else:
             render_coll = bpy.data.collections[render_coll_name]
             
-        if viewport_coll_name not in bpy.data.collections:
-            viewport_coll = bpy.data.collections.new(viewport_coll_name)
-            context.scene.collection.children.link(viewport_coll)
-        else:
-            viewport_coll = bpy.data.collections[viewport_coll_name]
-
         # Camera setup
         if self.setup_render:
             self.setup_360_camera()
@@ -288,7 +310,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
                 for pos, col_u, scl_u, rot_u in parser.iter_chunks(units, batch_size=1000000):
                     # Decode
-                    col, scl, rot = parser.decode_attributes(col_u, scl_u, rot_u)
+                    # Note: decode_attributes now returns quats AND eulers
+                    col, scl, quats, eulers = parser.decode_attributes(col_u, scl_u, rot_u)
                     
                     # --- 1. Binning for Render Chunks (Grid Split) ---
                     # Calculate grid indices for each point
@@ -310,7 +333,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         spatial_chunks[key]['pos'].append(pos[mask])
                         spatial_chunks[key]['col'].append(col[mask])
                         spatial_chunks[key]['scl'].append(scl[mask])
-                        spatial_chunks[key]['rot'].append(rot[mask])
+                        spatial_chunks[key]['rot'].append(eulers[mask]) # Use Eulers for Geometry Nodes
                         # Store LOD level for each point (since chunks can mix LODs now)
                         spatial_chunks[key]['lod'].append(np.full(np.sum(mask), lvl, dtype=np.int32))
 
@@ -325,12 +348,12 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                             vp_pos_list.append(pos[mask])
                             vp_col_list.append(col[mask])
                             vp_scl_list.append(scl[mask])
-                            vp_rot_list.append(rot[mask])
+                            vp_rot_list.append(quats[mask]) # Use Quaternions for GLSL
                     else:
                         vp_pos_list.append(pos)
                         vp_col_list.append(col)
                         vp_scl_list.append(scl)
-                        vp_rot_list.append(rot)
+                        vp_rot_list.append(quats) # Use Quaternions for GLSL
         
         # Apply RENDER Geometry Nodes (LOD Logic)
             # Create Render Chunks from Spatial Grid
@@ -366,16 +389,51 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
                 self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod, hide_render_force=should_hide)
 
-            # Create Unified Viewport Object
+            # Create Unified Viewport Object OR GLSL Renderer
             if vp_pos_list:
-                print("Creating Unified Viewport Proxy Object...")
                 vp_pos = np.concatenate(vp_pos_list)
                 vp_col = np.concatenate(vp_col_list)
                 vp_scl = np.concatenate(vp_scl_list)
                 vp_rot = np.concatenate(vp_rot_list)
                 
-                self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_rot)
-                print(f"Viewport Proxy Created: {len(vp_pos)} points.")
+                if self.use_glsl and LCCGLSLRenderer:
+                    print(f"Initializing GLSL Renderer with {len(vp_pos)} points...")
+                    global glsl_renderer, draw_handler
+                    
+                    # Unregister old handler if exists
+                    if draw_handler:
+                        bpy.types.SpaceView3D.draw_handler_remove(draw_handler, 'WINDOW')
+                        draw_handler = None
+                        
+                    glsl_renderer = LCCGLSLRenderer()
+                    glsl_renderer.load_data(vp_pos, vp_col, vp_scl, vp_rot)
+                    
+                    # Register new handler
+                    draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                        self.draw_callback, (), 'WINDOW', 'POST_VIEW'
+                    )
+                    
+                    # Force redraw
+                    for area in context.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            area.tag_redraw()
+                            
+                    self.report({'INFO'}, f"GLSL Renderer Initialized: {len(vp_pos)} points.")
+                else:
+                    print("Creating Unified Viewport Proxy Object (Mesh)...")
+                    # For mesh fallback, we need Eulers, but we have Quaternions in vp_rot_list.
+                    # Convert back to Euler for mesh
+                    vp_euler = quaternion_to_euler_numpy(vp_rot)
+                    
+                    viewport_coll_name = "LCC_Viewport"
+                    if viewport_coll_name not in bpy.data.collections:
+                        viewport_coll = bpy.data.collections.new(viewport_coll_name)
+                        context.scene.collection.children.link(viewport_coll)
+                    else:
+                        viewport_coll = bpy.data.collections[viewport_coll_name]
+                        
+                    self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_euler)
+                    print(f"Viewport Proxy Created: {len(vp_pos)} points.")
                 
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
@@ -383,12 +441,35 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             traceback.print_exc()
             return {'CANCELLED'}
 
-        if total_points == 0:
-            self.report({'WARNING'}, "No data loaded.")
-            return {'CANCELLED'}
+        if total_points == 0 and not spatial_chunks and not vp_pos_list:
+             # Just a warning if nothing happened
+             pass
             
-        self.report({'INFO'}, f"Imported {total_points} splats. {len(spatial_chunks)} Render chunks, 1 Viewport proxy.")
         return {'FINISHED'}
+
+    def draw_callback(self):
+        global glsl_renderer
+        if glsl_renderer:
+            # Sort logic could be added here or in a separate timer
+            # For now, just draw
+            
+            # Simple sort check: every 10 frames or so?
+            # Or just check camera distance change.
+            # Implementing a simple check:
+            try:
+                # We can try to sort if we can get camera pos easily
+                view_matrix = bpy.context.region_data.view_matrix
+                cam_pos = view_matrix.inverted().translation
+                
+                # Basic throttling: only sort if camera moved > threshold?
+                # For now, let's just call sort_and_update. 
+                # If it's too slow, we can optimize.
+                # glsl_renderer.sort_and_update(cam_pos) 
+                # (Disabling sort by default for performance until verified)
+                
+                glsl_renderer.draw()
+            except Exception as e:
+                print(f"GLSL Draw Error: {e}")
 
     def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, hide_render_force=False):
         """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
@@ -472,6 +553,13 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         for obj in bpy.data.objects:
             if "LCC_Render_Chunk" in obj.name or "LCC_Viewport_Proxy" in obj.name:
                 bpy.data.objects.remove(obj, do_unlink=True)
+        
+        # Cleanup GLSL Renderer
+        global draw_handler, glsl_renderer
+        if draw_handler:
+            bpy.types.SpaceView3D.draw_handler_remove(draw_handler, 'WINDOW')
+            draw_handler = None
+        glsl_renderer = None
 
     # --- GEOMETRY NODES FOR RENDER (With LOD Culling) ---
     def create_render_geonodes(self, obj, density, thickness, render_dist):
@@ -782,6 +870,13 @@ def register():
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
+    
+    # Cleanup GLSL Renderer
+    global draw_handler, glsl_renderer
+    if draw_handler:
+        bpy.types.SpaceView3D.draw_handler_remove(draw_handler, 'WINDOW')
+        draw_handler = None
+    glsl_renderer = None
 
 if __name__ == "__main__":
     register()
