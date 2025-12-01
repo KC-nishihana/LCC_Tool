@@ -214,6 +214,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     
     lod_distance: bpy.props.FloatProperty(name="Render Distance", default=100.0, min=1.0, description="Points within this distance will be fully rendered")
     
+    culling_distance: bpy.props.FloatProperty(name="Chunk Culling Distance", default=0.0, min=0.0, description="Chunks further than this distance will be disabled in render (0 = disabled)")
+    
     # Determines how much data is sampled for the viewport proxy object
     viewport_density: bpy.props.FloatProperty(
         name="Viewport Density (%)", 
@@ -329,13 +331,16 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         vp_col_list.append(col)
                         vp_scl_list.append(scl)
                         vp_rot_list.append(rot)
-                    
-                    count = len(pos)
-                    total_points += count
-                    print(f"Processed Batch (LOD {lvl}): {count} points")
-
+        
+        # Apply RENDER Geometry Nodes (LOD Logic)
             # Create Render Chunks from Spatial Grid
             print(f"Creating {len(spatial_chunks)} Spatial Render Chunks...")
+            
+            # Get Camera Location for Culling
+            target_cam = bpy.data.objects.get("PanoramaCam")
+            if not target_cam: target_cam = context.scene.camera
+            cam_loc = target_cam.location if target_cam else Vector((0, 0, 0))
+
             for key, data in spatial_chunks.items():
                 gx, gy, gz = key
                 chunk_name = f"LCC_Render_Chunk_{gx}_{gy}_{gz}"
@@ -346,7 +351,20 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 c_rot = np.concatenate(data['rot'])
                 c_lod = np.concatenate(data['lod'])
                 
-                self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod)
+                # Culling Logic
+                should_hide = False
+                if self.culling_distance > 0:
+                    # Calculate Chunk Center
+                    center_x = (gx + 0.5) * chunk_grid_size
+                    center_y = (gy + 0.5) * chunk_grid_size
+                    center_z = (gz + 0.5) * chunk_grid_size
+                    chunk_center = Vector((center_x, center_y, center_z))
+                    
+                    dist = (chunk_center - cam_loc).length
+                    if dist > self.culling_distance:
+                        should_hide = True
+                
+                self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod, hide_render_force=should_hide)
 
             # Create Unified Viewport Object
             if vp_pos_list:
@@ -372,7 +390,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         self.report({'INFO'}, f"Imported {total_points} splats. {len(spatial_chunks)} Render chunks, 1 Viewport proxy.")
         return {'FINISHED'}
 
-    def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels):
+    def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, hide_render_force=False):
         """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
         mesh = bpy.data.meshes.new(name=chunk_name)
         
@@ -387,7 +405,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         # Settings for RENDER object
         obj.hide_viewport = True  # Hidden in viewport
-        obj.hide_render = False   # Visible in render
+        obj.hide_render = hide_render_force   # Visible in render unless culled
         
         # Bounding Box Display (optional, good for debugging invisible objects)
         if self.show_bounds:
