@@ -5,19 +5,29 @@ import struct
 import numpy as np
 import math
 import sys
+import importlib
+import traceback
 from mathutils import Quaternion, Vector, Matrix
 from bpy_extras.object_utils import world_to_camera_view
 
 # Add current directory to sys.path to ensure local imports work
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.append(current_dir)
+# Hardcoding path because __file__ in Blender Text Editor can be unreliable (resolves to C:\)
+target_dir = r"c:\Users\100022\OneDrive - クモノスコーポレーション　株式会社　\02_Development\02_blender\LCC_Tool"
+if target_dir not in sys.path:
+    sys.path.append(target_dir)
 
+# Attempt Import with Reload support
+LCCGLSLRenderer = None
+import_error_msg = None
 try:
+    import LCC_GLSL_Renderer
+    importlib.reload(LCC_GLSL_Renderer) # Force reload to pick up changes
     from LCC_GLSL_Renderer import LCCGLSLRenderer
-except ImportError:
-    # Fallback or handle error if file not found yet
-    print("Warning: LCC_GLSL_Renderer not found. GLSL rendering will be disabled.")
+    print("LCC_GLSL_Renderer module loaded successfully.")
+except Exception as e:
+    import_error_msg = str(e)
+    print(f"ERROR: Failed to import LCC_GLSL_Renderer: {e}")
+    traceback.print_exc()
     LCCGLSLRenderer = None
 
 # ------------------------------------------------------------------------
@@ -25,6 +35,7 @@ except ImportError:
 # ------------------------------------------------------------------------
 glsl_renderer = None
 draw_handler = None
+last_cam_pos = None # For sort optimization
 
 def update_view(scene, context):
     # Callback to update sorting if needed
@@ -396,6 +407,18 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 vp_scl = np.concatenate(vp_scl_list)
                 vp_rot = np.concatenate(vp_rot_list)
                 
+                print(f"DEBUG: use_glsl={self.use_glsl}, LCCGLSLRenderer_Class={LCCGLSLRenderer}")
+                if LCCGLSLRenderer is None:
+                    print(f"DEBUG: Import Error was: {import_error_msg}")
+                    print(f"DEBUG: sys.path: {sys.path}")
+                    # Try importing again to force error log here
+                    try:
+                        import LCC_GLSL_Renderer
+                    except Exception as e:
+                        print(f"DEBUG: Re-import attempt failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                 if self.use_glsl and LCCGLSLRenderer:
                     print(f"Initializing GLSL Renderer with {len(vp_pos)} points...")
                     global glsl_renderer, draw_handler
@@ -448,28 +471,35 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         return {'FINISHED'}
 
     def draw_callback(self):
-        global glsl_renderer
+        global glsl_renderer, last_cam_pos
         if glsl_renderer:
-            # Sort logic could be added here or in a separate timer
-            # For now, just draw
-            
-            # Simple sort check: every 10 frames or so?
-            # Or just check camera distance change.
-            # Implementing a simple check:
             try:
-                # We can try to sort if we can get camera pos easily
-                view_matrix = bpy.context.region_data.view_matrix
+                # 1. Get Camera Position
+                region_data = bpy.context.region_data
+                if not region_data: return
+                
+                view_matrix = region_data.view_matrix
+                # Camera position in World Space
                 cam_pos = view_matrix.inverted().translation
                 
-                # Basic throttling: only sort if camera moved > threshold?
-                # For now, let's just call sort_and_update. 
-                # If it's too slow, we can optimize.
-                # glsl_renderer.sort_and_update(cam_pos) 
-                # (Disabling sort by default for performance until verified)
+                # 2. Check if sorting is needed (Distance Check)
+                # Sort only if camera moved more than X units (e.g. 0.1m)
+                should_sort = True
+                if last_cam_pos:
+                    dist = (cam_pos - last_cam_pos).length
+                    if dist < 0.1: # Threshold
+                        should_sort = False
                 
+                if should_sort:
+                    glsl_renderer.sort_and_update(cam_pos)
+                    last_cam_pos = cam_pos.copy()
+                
+                # 3. Draw
                 glsl_renderer.draw()
+                
             except Exception as e:
-                print(f"GLSL Draw Error: {e}")
+                # Prevent console flood on error
+                pass
 
     def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, hide_render_force=False):
         """Creates a chunk object for RENDERING ONLY (Hidden in Viewport)"""
