@@ -7,14 +7,51 @@ import math
 import sys
 import importlib
 import traceback
+from pathlib import Path
+import inspect
 from mathutils import Quaternion, Vector, Matrix
 from bpy_extras.object_utils import world_to_camera_view
 
-# Add current directory to sys.path to ensure local imports work
-# Hardcoding path because __file__ in Blender Text Editor can be unreliable (resolves to C:\)
-target_dir = r"c:\Users\100022\OneDrive - クモノスコーポレーション　株式会社　\02_Development\02_blender\LCC_Tool"
-if target_dir not in sys.path:
-    sys.path.append(target_dir)
+def _resolve_script_dir():
+    """
+    Determine the directory that contains this script so local imports work
+    even when Blender executes the file without a reliable __file__.
+    """
+
+    module_file = getattr(sys.modules.get(__name__), "__file__", None)
+    if module_file:
+        path = Path(module_file).resolve()
+        if path.exists():
+            return path.parent
+
+    text_block = bpy.data.texts.get("LCC_Render.py")
+    if text_block and text_block.filepath:
+        text_path = Path(text_block.filepath).resolve()
+        if text_path.exists():
+            return text_path.parent
+
+    try:
+        frame_file = inspect.getsourcefile(sys.modules[__name__])
+        if frame_file:
+            path = Path(frame_file).resolve()
+            if path.exists():
+                return path.parent
+    except Exception:
+        pass
+
+    for candidate in sys.path:
+        candidate_path = Path(candidate)
+        if (candidate_path / "LCC_Render.py").exists():
+            return candidate_path.resolve()
+        if (candidate_path / "LCC_GLSL_Renderer.py").exists():
+            return candidate_path.resolve()
+
+    return Path.cwd()
+
+
+current_dir = _resolve_script_dir()
+if current_dir and str(current_dir) not in sys.path:
+    sys.path.append(str(current_dir))
 
 # Attempt Import with Reload support
 LCCGLSLRenderer = None
