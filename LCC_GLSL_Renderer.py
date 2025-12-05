@@ -379,7 +379,7 @@ class LCCGLSLRenderer:
             if self.rotTex: self.shader.uniform_sampler("rotTex", self.rot_tex)
             
             # Draw
-            self.batch.draw_instanced(self.shader)
+            self.batch.draw_instanced(self.shader, self.num_instances)
         finally:
             # ---- Restore GPU State ----
             gpu.state.blend_set(prev_blend)
@@ -425,7 +425,7 @@ class LCCGLSLRenderer:
             if self.rotTex:
                 self.shader.uniform_sampler("rotTex", self.rot_tex)
 
-            self.batch.draw_instanced(self.shader)
+            self.batch.draw_instanced(self.shader, self.num_instances)
         finally:
             # ---- Restore GPU State ----
             gpu.state.blend_set(prev_blend)

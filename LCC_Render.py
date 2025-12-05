@@ -447,61 +447,61 @@ class LCCParser:
 
 class IMPORT_OT_lcc(bpy.types.Operator):
     bl_idname = "import_scene.lcc"
-    bl_label = "Import LCC (Split View/Render)"
+    bl_label = "LCCをインポート（ビュー/レンダー分割）"
     bl_description = (
-        "Import LCC Data (Data Organization Format originated from XGRIDS). "
-        "See: https://github.com/xgrids/LCCWhitepaper"
+        "LCCデータ（XGRIDS発のデータオーガナイズ形式）を読み込みます。"
+        "仕様: https://github.com/xgrids/LCCWhitepaper"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     
-    lod_min: bpy.props.IntProperty(name="Min LOD", default=0, min=0, max=5)
-    lod_max: bpy.props.IntProperty(name="Max LOD", default=0, min=0, max=8)
-    
-    scale_density: bpy.props.FloatProperty(name="Scale Multiplier", default=1.5, min=0.1)
-    min_thickness: bpy.props.FloatProperty(name="Min Thickness", default=0.05, min=0.0)
-    
-    chunk_size: bpy.props.FloatProperty(name="Chunk Grid Size", default=10.0, min=1.0, description="Size of the grid cell for splitting render chunks")
-    
-    lod_distance: bpy.props.FloatProperty(name="Render Distance", default=100.0, min=1.0, description="Points within this distance will be fully rendered")
-    
-    culling_distance: bpy.props.FloatProperty(name="Chunk Culling Distance", default=0.0, min=0.0, description="Chunks further than this distance will be disabled in render (0 = disabled)")
-    
+    lod_min: bpy.props.IntProperty(name="最小LOD", default=0, min=0, max=5)
+    lod_max: bpy.props.IntProperty(name="最大LOD", default=0, min=0, max=8)
+
+    scale_density: bpy.props.FloatProperty(name="スケール倍率", default=1.5, min=0.1)
+    min_thickness: bpy.props.FloatProperty(name="最小厚み", default=0.05, min=0.0)
+
+    chunk_size: bpy.props.FloatProperty(name="チャンクグリッドサイズ", default=10.0, min=1.0, description="レンダーチャンクを分割するグリッドセルの大きさ")
+
+    lod_distance: bpy.props.FloatProperty(name="描画距離", default=100.0, min=1.0, description="この距離以内のポイントをフル描画します")
+
+    culling_distance: bpy.props.FloatProperty(name="チャンクカリング距離", default=0.0, min=0.0, description="この距離より遠いチャンクをレンダーで無効化します (0 で無効)")
+
     # Determines how much data is sampled for the viewport proxy object
     viewport_density: bpy.props.FloatProperty(
-        name="Viewport Density (%)", 
-        default=10.0, 
-        min=0.1, 
-        max=100.0, 
-        description="Percentage of points to use for the viewport GLSL renderer"
+        name="ビューポート密度(%)",
+        default=10.0,
+        min=0.1,
+        max=100.0,
+        description="GLSL ビューポートレンダラーに使うポイントの割合"
     )
-    
-    setup_render: bpy.props.BoolProperty(name="Setup 360 Render", default=True)
-    show_bounds: bpy.props.BoolProperty(name="Show Bounds", default=True)
-    
-    use_glsl: bpy.props.BoolProperty(name="Use GLSL Viewport", default=True, description="Use high-performance OpenGL renderer for viewport")
+
+    setup_render: bpy.props.BoolProperty(name="360°レンダーを設定", default=True)
+    show_bounds: bpy.props.BoolProperty(name="バウンディングを表示", default=True)
+
+    use_glsl: bpy.props.BoolProperty(name="GLSLビューポートを使用", default=True, description="ビューポートで高速な OpenGL レンダラーを使います")
 
     # 3DGS compatibility
     use_3dgs_attributes: bpy.props.BoolProperty(
-        name="Use 3DGS Attributes",
+        name="3DGS属性を使用",
         default=False,
-        description="Write 3DGS-compatible vertex attributes (f_dc_*, scale_*, rot_*, opacity) and attach an existing Gaussian Splatting node group"
+        description="3DGS形式のLCCを正しく復号するためにログスケール等を展開します（チャンクとLCC_GN系ビューアは常に自前で生成）"
     )
     g3ds_node_group: bpy.props.StringProperty(
-        name="3DGS Node Group",
+        name="3DGSノードグループ",
         default="Gaussian splatting",
-        description="Existing Geometry Nodes group that consumes 3DGS PLY attributes"
+        description="3DGS PLY属性を消費する既存の Geometry Nodes グループ名"
     )
     rot_wxyz: bpy.props.BoolProperty(
-        name="Rotation WXYZ order",
+        name="回転をWXYZ順で保存",
         default=False,
-        description="When enabled, rot_0..3 are stored as w,x,y,z (instead of x,y,z,w)"
+        description="有効にすると rot_0..3 を x,y,z,w ではなく w,x,y,z の順で保存します"
     )
 
     def execute(self, context):
         if not self.filepath.lower().endswith(".lcc"):
-            self.report({'ERROR'}, "Please select an .lcc file.")
+            self.report({'ERROR'}, ".lcc ファイルを選択してください。")
             return {'CANCELLED'}
             
         self.cleanup_old_objects()
@@ -538,7 +538,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         total_points = 0
         
         # Buffer for Viewport Object (Unified)
-        vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list, vp_opa_list = [], [], [], [], []
+        vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list, vp_rot_quat_list, vp_opa_list = [], [], [], [], [], []
         
         # Spatial Grid Buffer for Render Chunks
         # Key: (grid_x, grid_y, grid_z), Value: lists of (pos, col, scl, rot, lod)
@@ -582,9 +582,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         spatial_chunks[key]['pos'].append(pos[mask])
                         spatial_chunks[key]['col'].append(col[mask])
                         spatial_chunks[key]['scl'].append(scl[mask])
-                        # Store quats when targeting 3DGS attributes, otherwise Eulers for legacy GN
-                        rot_payload = quats[mask] if self.use_3dgs_attributes else eulers[mask]
-                        spatial_chunks[key]['rot'].append(rot_payload)
+                        # ビューア系は常にオイラー角を使用
+                        spatial_chunks[key]['rot'].append(eulers[mask])
                         if opacity is not None:
                             spatial_chunks[key]['opa'].append(opacity[mask])
                         # Store LOD level for each point (since chunks can mix LODs now)
@@ -601,14 +600,16 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                             vp_pos_list.append(pos[mask])
                             vp_col_list.append(col[mask])
                             vp_scl_list.append(scl[mask])
-                            vp_rot_list.append(quats[mask]) # Use Quaternions for GLSL
+                            vp_rot_list.append(eulers[mask])
+                            vp_rot_quat_list.append(quats[mask])
                             if opacity is not None:
                                 vp_opa_list.append(opacity[mask])
                     else:
                         vp_pos_list.append(pos)
                         vp_col_list.append(col)
                         vp_scl_list.append(scl)
-                        vp_rot_list.append(quats) # Use Quaternions for GLSL
+                        vp_rot_list.append(eulers)
+                        vp_rot_quat_list.append(quats)
                         if opacity is not None:
                             vp_opa_list.append(opacity)
         
@@ -617,43 +618,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             spatial_chunks, vp_pos_list, origin_offset = self._recenter_to_origin(
                 spatial_chunks, vp_pos_list, render_coll
             )
-
-            # If 3DGS-compatible export is requested, skip custom GN and build a single mesh with 3DGS attrs
-            if self.use_3dgs_attributes:
-                pos_all, col_all, scl_all, rot_all, opa_all = [], [], [], [], []
-                for data in spatial_chunks.values():
-                    if data['pos']: pos_all.append(np.concatenate(data['pos']))
-                    if data['col']: col_all.append(np.concatenate(data['col']))
-                    if data['scl']: scl_all.append(np.concatenate(data['scl']))
-                    if data['rot']: rot_all.append(np.concatenate(data['rot']))
-                    if data['opa']: opa_all.append(np.concatenate(data['opa']))
-
-                if not pos_all:
-                    self.report({'WARNING'}, "No points found for 3DGS export.")
-                    return {'CANCELLED'}
-
-                pos_all = np.concatenate(pos_all)
-                col_all = np.concatenate(col_all) if col_all else np.zeros((len(pos_all),4), dtype=np.float32)
-                scl_all = np.concatenate(scl_all) if scl_all else np.ones((len(pos_all),3), dtype=np.float32)
-                rot_all = np.concatenate(rot_all) if rot_all else np.zeros((len(pos_all),4), dtype=np.float32)
-                opa_all = np.concatenate(opa_all) if opa_all else np.ones((len(pos_all),), dtype=np.float32)
-
-                obj_name = "LCC_3DGS"
-                obj = self._create_3dgs_object(
-                    render_coll,
-                    obj_name,
-                    pos_all,
-                    col_all,
-                    scl_all,
-                    rot_all,
-                    opa_all,
-                    origin_offset,
-                    self.g3ds_node_group,
-                    self.rot_wxyz,
-                )
-
-                # Skip legacy render/viewport paths when 3DGS is used
-                return {'FINISHED'}
 
             # Create Render Chunks from Spatial Grid
             print(f"Creating {len(spatial_chunks)} Spatial Render Chunks...")
@@ -692,7 +656,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 vp_pos = np.concatenate(vp_pos_list)
                 vp_col = np.concatenate(vp_col_list)
                 vp_scl = np.concatenate(vp_scl_list)
-                vp_rot = np.concatenate(vp_rot_list)
+                vp_rot_euler = np.concatenate(vp_rot_list)
+                vp_rot_quat = np.concatenate(vp_rot_quat_list)
                 vp_opa = np.concatenate(vp_opa_list) if vp_opa_list else None
                 
                 print(f"DEBUG: use_glsl={self.use_glsl}, LCCGLSLRenderer_Class={LCCGLSLRenderer}")
@@ -717,7 +682,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         draw_handler = None
                         
                     glsl_renderer = LCCGLSLRenderer()
-                    glsl_renderer.load_data(vp_pos, vp_col, vp_scl, vp_rot)
+                    glsl_renderer.load_data(vp_pos, vp_col, vp_scl, vp_rot_quat)
                     
                     # Register new handler
                     draw_handler = bpy.types.SpaceView3D.draw_handler_add(
@@ -732,10 +697,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     self.report({'INFO'}, f"GLSL Renderer Initialized: {len(vp_pos)} points.")
                 else:
                     print("Creating Unified Viewport Proxy Object (Mesh)...")
-                    # For mesh fallback, we need Eulers, but we have Quaternions in vp_rot_list.
-                    # Convert back to Euler for mesh
-                    vp_euler = quaternion_to_euler_numpy(vp_rot)
-                    
                     viewport_coll_name = "LCC_Viewport"
                     if viewport_coll_name not in bpy.data.collections:
                         viewport_coll = bpy.data.collections.new(viewport_coll_name)
@@ -743,7 +704,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     else:
                         viewport_coll = bpy.data.collections[viewport_coll_name]
                         
-                    self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_euler, opacities=vp_opa)
+                    self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_rot_euler, opacities=vp_opa)
                     print(f"Viewport Proxy Created: {len(vp_pos)} points.")
                 
         except Exception as e:
@@ -887,55 +848,110 @@ class IMPORT_OT_lcc(bpy.types.Operator):
              
         attr_lod.data.foreach_set("value", final_lod_data)
 
-    def _add_attributes_3dgs(self, mesh, colors, scales, quats, opacities=None, use_wxyz=False, add_log_opacity=True):
-        """Populate mesh attributes following 3DGS PLY conventions."""
+    def _add_attributes_3dgs(self, mesh, colors, scales, quats,
+                             opacities=None, use_wxyz=False, add_log_opacity=True):
+        """3DGS 用の Attribute を Mesh に追加する。
+
+        作る Attribute は 3DGS PLY の必須分だけ：
+          - f_dc_0, f_dc_1, f_dc_2
+          - opacity
+          - scale_0, scale_1, scale_2  （log-scale）
+          - rot_0, rot_1, rot_2, rot_3
+        """
+        import numpy as _np
+
         Y00 = 0.28209479177387814
 
-        # DC color coefficients
-        f_dc = colors[:, :3].astype(np.float32) / Y00
-        dc0 = mesh.attributes.new("f_dc_0", 'FLOAT', 'POINT')
-        dc1 = mesh.attributes.new("f_dc_1", 'FLOAT', 'POINT')
-        dc2 = mesh.attributes.new("f_dc_2", 'FLOAT', 'POINT')
-        dc0.data.foreach_set("value", f_dc[:, 0])
-        dc1.data.foreach_set("value", f_dc[:, 1])
-        dc2.data.foreach_set("value", f_dc[:, 2])
+        # ---- 基本チェック ----
+        n_verts = len(mesh.vertices)
 
-        # Opacity
-        opa = opacities if opacities is not None else np.ones(len(mesh.vertices), dtype=np.float32)
-        opa_attr = mesh.attributes.new("opacity", 'FLOAT', 'POINT')
-        opa_attr.data.foreach_set("value", np.asarray(opa, dtype=np.float32))
+        colors = _np.asarray(colors, dtype=_np.float32)
+        scales = _np.asarray(scales, dtype=_np.float32)
+        quats  = _np.asarray(quats,  dtype=_np.float32)
 
-        if add_log_opacity:
-            log_attr = mesh.attributes.new("log_opacity", 'FLOAT', 'POINT')
-            log_attr.data.foreach_set("value", np.log(np.clip(np.asarray(opa, dtype=np.float32), 1e-6, 1.0)))
-
-        # Scales (assumed already decoded; caller can exp() before calling if needed)
-        s0 = mesh.attributes.new("scale_0", 'FLOAT', 'POINT')
-        s1 = mesh.attributes.new("scale_1", 'FLOAT', 'POINT')
-        s2 = mesh.attributes.new("scale_2", 'FLOAT', 'POINT')
-        s0.data.foreach_set("value", scales[:, 0].astype(np.float32))
-        s1.data.foreach_set("value", scales[:, 1].astype(np.float32))
-        s2.data.foreach_set("value", scales[:, 2].astype(np.float32))
-
-        # Rotations
-        q = quats.astype(np.float32)
-        if use_wxyz and q.shape[1] >= 4:
-            rot = np.stack([q[:, 3], q[:, 0], q[:, 1], q[:, 2]], axis=1)
+        if opacities is None:
+            opa = _np.ones(n_verts, dtype=_np.float32)
         else:
-            rot = q
+            opa = _np.asarray(opacities, dtype=_np.float32).reshape(-1)
 
-        r0 = mesh.attributes.new("rot_0", 'FLOAT', 'POINT')
-        r1 = mesh.attributes.new("rot_1", 'FLOAT', 'POINT')
-        r2 = mesh.attributes.new("rot_2", 'FLOAT', 'POINT')
-        r3 = mesh.attributes.new("rot_3", 'FLOAT', 'POINT')
-        r0.data.foreach_set("value", rot[:, 0])
-        r1.data.foreach_set("value", rot[:, 1])
-        r2.data.foreach_set("value", rot[:, 2])
-        r3.data.foreach_set("value", rot[:, 3])
+        # サイズ不一致なら即エラーにして場所を特定しやすくする
+        if (
+            colors.shape[0] != n_verts
+            or scales.shape[0] != n_verts
+            or quats.shape[0]  != n_verts
+            or opa.shape[0]    != n_verts
+        ):
+            raise ValueError(
+                f"3DGS attribute size mismatch: verts={n_verts}, "
+                f"colors={colors.shape}, scales={scales.shape}, "
+                f"quats={quats.shape}, opa={opa.shape}"
+            )
+
+        # foreach_set 用のセーフラッパ
+        # attr.data の長さが 0 の場合は警告を出してスキップ
+        def _safe_set(attr_name, values):
+            attr = mesh.attributes.new(attr_name, 'FLOAT', 'POINT')
+            data   = attr.data
+            needed = len(data)
+            given  = len(values)
+            print(f"[LCC DEBUG] attr {attr_name}: verts={n_verts}, "
+                  f"attr_len={needed}, given={given}")
+
+            if needed == 0:
+                # ここが今回のエラー原因パターン
+                print(
+                    f"[LCC WARNING] Attribute '{attr_name}' の長さが 0 です。"
+                    "Blender が Attribute 配列の確保に失敗している可能性があります "
+                    "(メモリ不足 or Blender バージョン依存)。この Attribute はスキップします。"
+                )
+                return
+
+            if given != needed:
+                raise ValueError(
+                    f"Attribute '{attr_name}' length mismatch: verts={needed}, given={given}"
+                )
+
+            data.foreach_set("value", _np.asarray(values, dtype=_np.float32))
+
+        # ---- DC color (f_dc_0..2) ----
+        f_dc = colors[:, :3] / Y00
+        _safe_set("f_dc_0", f_dc[:, 0])
+        _safe_set("f_dc_1", f_dc[:, 1])
+        _safe_set("f_dc_2", f_dc[:, 2])
+
+        # ---- opacity ----
+        _safe_set("opacity", opa)
+
+        # ---- log-scale 半径 (scale_0..2) ----
+        scales_log = _np.log(_np.clip(scales, 1e-8, None))
+        _safe_set("scale_0", scales_log[:, 0])
+        _safe_set("scale_1", scales_log[:, 1])
+        _safe_set("scale_2", scales_log[:, 2])
+
+        # ---- 回転 (quaternion) ----
+        # use_wxyz=True のときは (w,x,y,z) を (x,y,z,w) に並べ替え
+        if use_wxyz and quats.shape[1] >= 4:
+            rot = _np.stack(
+                [quats[:, 3], quats[:, 0], quats[:, 1], quats[:, 2]],
+                axis=1
+            )
+        else:
+            rot = quats
+
+        _safe_set("rot_0", rot[:, 0])
+        _safe_set("rot_1", rot[:, 1])
+        _safe_set("rot_2", rot[:, 2])
+        _safe_set("rot_3", rot[:, 3])
+
 
     def _create_3dgs_object(self, collection, name, positions, colors, scales, quats, opacities, origin_offset, node_group_name, use_wxyz):
+        count = len(positions)
+        if count == 0:
+            print("[LCC] 3DGSオブジェクトに頂点がありません。スキップします。")
+            return None
+
         mesh = bpy.data.meshes.new(name)
-        mesh.vertices.add(len(positions))
+        mesh.vertices.add(count)
         mesh.vertices.foreach_set("co", positions.astype(np.float32).flatten())
 
         self._add_attributes_3dgs(mesh, colors, scales, quats, opacities=opacities, use_wxyz=use_wxyz)
@@ -1260,40 +1276,40 @@ class IMPORT_OT_lcc(bpy.types.Operator):
 
 class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
     bl_idname = "lcc.render_360_preview_glsl"
-    bl_label = "Render 360 Preview (GLSL)"
+    bl_label = "360プレビューをレンダー (GLSL)"
     bl_options = {'REGISTER'}
 
     width: bpy.props.IntProperty(
-        name="Width",
+        name="幅",
         default=2048,
         min=256,
         max=8192,
     )
     height: bpy.props.IntProperty(
-        name="Height",
+        name="高さ",
         default=1024,
         min=128,
         max=4096,
     )
     frame_start: bpy.props.IntProperty(
-        name="Start Frame",
+        name="開始フレーム",
         default=1,
         min=1,
     )
     frame_end: bpy.props.IntProperty(
-        name="End Frame",
+        name="終了フレーム",
         default=90,
         min=1,
     )
     face_size: bpy.props.IntProperty(
-        name="Face Size",
+        name="キューブ面サイズ",
         default=512,
         min=64,
         max=4096,
         description="キューブマップ1面の解像度。未指定時は width/4 を使用します。"
     )
     output_dir: bpy.props.StringProperty(
-        name="Output Directory",
+        name="出力ディレクトリ",
         subtype='DIR_PATH',
         default="//LCC_360_Preview/"
     )
@@ -1427,19 +1443,19 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
         return {'FINISHED'}
 
 class LCC_PT_Panel(bpy.types.Panel):
-    bl_label = "LCC Tools (Split View/Render)"
+    bl_label = "LCCツール（ビュー/レンダー分割）"
     bl_idname = "LCC_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'LCC Tools'
+    bl_category = 'LCCツール'
 
     def draw(self, context):
         layout = self.layout
-        layout.operator("import_scene.lcc", text="Import LCC (.lcc)")
+        layout.operator("import_scene.lcc", text="LCCを読み込み (.lcc)")
 
         col = layout.box()
-        col.label(text="GLSL 360 Preview", icon='RENDER_STILL')
-        col.operator("lcc.render_360_preview_glsl", text="Render 360 Preview (GLSL)")
+        col.label(text="GLSL 360プレビュー", icon='RENDER_STILL')
+        col.operator("lcc.render_360_preview_glsl", text="360プレビューをレンダー (GLSL)")
 
 classes = (
     IMPORT_OT_lcc,
