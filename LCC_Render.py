@@ -11,6 +11,7 @@ from pathlib import Path
 import inspect
 from mathutils import Quaternion, Vector, Matrix
 from bpy_extras.object_utils import world_to_camera_view
+import gpu
 
 def _resolve_script_dir():
     """
@@ -142,12 +143,119 @@ def quaternion_to_euler_numpy(quats):
 
     return np.stack((roll_x, pitch_y, yaw_z), axis=-1).astype(np.float32)
 
+def make_lookat(eye, target, up):
+    """
+    OpenGL 風の LookAt 行列を mathutils.Matrix で生成。
+    カメラ前方 = -Z になるように構成。
+    """
+    f = (target - eye).normalized()
+    s = f.cross(up).normalized()
+    u = s.cross(f)
+
+    m = Matrix((
+        ( s.x,  u.x, -f.x, 0.0),
+        ( s.y,  u.y, -f.y, 0.0),
+        ( s.z,  u.z, -f.z, 0.0),
+        (-s.dot(eye), -u.dot(eye),  f.dot(eye), 1.0),
+    ))
+    return m
+
+
+def make_perspective(fov_y_rad, aspect, z_near, z_far):
+    """
+    OpenGL 互換の透視投影行列。
+    fov_y_rad: ラジアン
+    """
+    f = 1.0 / math.tan(fov_y_rad * 0.5)
+    range_inv = 1.0 / (z_near - z_far)
+
+    return Matrix((
+        (f / aspect, 0.0,                        0.0,                           0.0),
+        (0.0,        f,                          0.0,                           0.0),
+        (0.0,        0.0, (z_far + z_near) * range_inv,  2.0 * z_far * z_near * range_inv),
+        (0.0,        0.0,                       -1.0,                           0.0),
+    ))
+
+
+def cubemap_to_equirect(faces, width, height):
+    """
+    faces: dict[str, np.ndarray] (PX, NX, PY, NY, PZ, NZ) 各 (N, N, 4) uint8
+    width, height: 出力 equirect サイズ
+    戻り値: (height, width, 4) uint8
+    """
+    out = np.zeros((height, width, 4), dtype=np.uint8)
+    face_size = list(faces.values())[0].shape[0]
+
+    # equirect grid
+    u = (np.arange(width) + 0.5) / width
+    v = (np.arange(height) + 0.5) / height
+    uu, vv = np.meshgrid(u, v)
+
+    phi = uu * 2.0 * np.pi - np.pi        # 水平: -pi ～ pi
+    theta = vv * np.pi - 0.5 * np.pi      # 垂直: -pi/2 ～ pi/2
+
+    x = np.cos(theta) * np.cos(phi)
+    y = np.sin(theta)
+    z = np.cos(theta) * np.sin(phi)
+
+    abs_x = np.abs(x)
+    abs_y = np.abs(y)
+    abs_z = np.abs(z)
+
+    max_axis = np.argmax(
+        np.stack([abs_x, abs_y, abs_z], axis=-1),
+        axis=-1
+    )
+
+    # 各面ごとにマスクしてサンプリング
+    def sample_face(mask, sc, tc, face_key):
+        if not np.any(mask):
+            return
+        sc = sc[mask]
+        tc = tc[mask]
+        u_face = (sc + 1.0) * 0.5
+        v_face = (tc + 1.0) * 0.5
+        ix = np.clip((u_face * (face_size - 1)).astype(np.int32), 0, face_size - 1)
+        iy = np.clip((v_face * (face_size - 1)).astype(np.int32), 0, face_size - 1)
+        out[mask] = faces[face_key][iy, ix]
+
+    # +X
+    mask = (max_axis == 0) & (x > 0)
+    sample_face(mask, -z / abs_x,  y / abs_x, 'PX')
+
+    # -X
+    mask = (max_axis == 0) & (x < 0)
+    sample_face(mask,  z / abs_x,  y / abs_x, 'NX')
+
+    # +Y
+    mask = (max_axis == 1) & (y > 0)
+    sample_face(mask,  x / abs_y, -z / abs_y, 'PY')
+
+    # -Y
+    mask = (max_axis == 1) & (y < 0)
+    sample_face(mask,  x / abs_y,  z / abs_y, 'NY')
+
+    # +Z
+    mask = (max_axis == 2) & (z > 0)
+    sample_face(mask,  x / abs_z,  y / abs_z, 'PZ')
+
+    # -Z
+    mask = (max_axis == 2) & (z < 0)
+    sample_face(mask, -x / abs_z,  y / abs_z, 'NZ')
+
+    return out
+
 class LCCParser:
     def __init__(self, meta_path):
         self.meta_path = meta_path
         self.dir_path = os.path.dirname(meta_path)
         self.meta = {}
         self.load_meta()
+
+        # Meta.lcc transform terms (used to place points in world coordinates)
+        self.meta_offset = np.array(self.meta.get("offset", [0, 0, 0]), dtype=np.float32)
+        self.meta_shift = np.array(self.meta.get("shift", [0, 0, 0]), dtype=np.float32)
+        self.meta_scale = np.array(self.meta.get("scale", [1, 1, 1]), dtype=np.float32)
 
     def load_meta(self):
         with open(self.meta_path, 'r', encoding='utf-8') as f:
@@ -159,7 +267,13 @@ class LCCParser:
             raise FileNotFoundError("Index.bin not found")
 
         total_level = self.meta.get("totalLevel", 1)
-        unit_entry_size = 4 + (4 + 8 + 4) * total_level
+        index_data_size = self.meta.get("indexDataSize", 0)
+
+        # Respect indexDataSize when provided to stay spec-compliant
+        if index_data_size and index_data_size > 0:
+            unit_entry_size = index_data_size
+        else:
+            unit_entry_size = 4 + (4 + 8 + 4) * total_level
         
         units = []
         file_size = os.path.getsize(index_path)
@@ -168,6 +282,9 @@ class LCCParser:
         with open(index_path, 'rb') as f:
             for i in range(num_units):
                 data = f.read(unit_entry_size)
+                if len(data) < 4 + (lod_level + 1) * 16:
+                    # Not enough bytes for this LOD entry in this unit
+                    continue
                 base_off = 4 + lod_level * 16
                 
                 count = struct.unpack_from('<I', data, base_off)[0]
@@ -191,6 +308,7 @@ class LCCParser:
         current_col = []
         current_scl = []
         current_rot = []
+        current_extra = []
         current_count = 0
         
         with open(data_path, 'rb') as f:
@@ -217,35 +335,45 @@ class LCCParser:
                 
                 rot_raw = chunk_matrix[:, 22:26].copy()
                 rot_data = rot_raw.view(dtype=np.uint32).reshape(count)
+
+                extra_raw = chunk_matrix[:, 26:32].copy()  # reserved/opacity/etc.
                 
                 current_pos.append(pos_data)
                 current_col.append(col_data)
                 current_scl.append(scl_data)
                 current_rot.append(rot_data)
+                current_extra.append(extra_raw)
                 current_count += count
                 
                 if current_count >= batch_size:
                     yield (
-                        np.concatenate(current_pos),
+                        self._apply_meta_transform(np.concatenate(current_pos)),
                         np.concatenate(current_col),
                         np.concatenate(current_scl),
-                        np.concatenate(current_rot)
+                        np.concatenate(current_rot),
+                        np.concatenate(current_extra)
                     )
                     current_pos = []
                     current_col = []
                     current_scl = []
                     current_rot = []
+                    current_extra = []
                     current_count = 0
                     
         if current_count > 0:
             yield (
-                np.concatenate(current_pos),
+                self._apply_meta_transform(np.concatenate(current_pos)),
                 np.concatenate(current_col),
                 np.concatenate(current_scl),
-                np.concatenate(current_rot)
+                np.concatenate(current_rot),
+                np.concatenate(current_extra)
             )
 
-    def decode_attributes(self, colors_u, scales_u, rots_u):
+    def _apply_meta_transform(self, positions):
+        """Apply Meta.lcc offset/shift/scale to positions."""
+        return (positions + self.meta_offset + self.meta_shift) * self.meta_scale
+
+    def decode_attributes(self, colors_u, scales_u, rots_u, extra_u=None, apply_exp_scale=False):
         colors = colors_u.view(dtype=np.uint8).reshape(-1, 4).astype(np.float32) / 255.0
         
         scale_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'scale'), None)
@@ -259,14 +387,49 @@ class LCCParser:
         scales_norm = scales_u.astype(np.float32) / 65535.0
         scales = s_min + scales_norm * (s_max - s_min)
         
+        # 3DGS の標準実装では scale が log スケールのことが多い
+        # 必要に応じて exp() 変換を適用
+        # ※ まずは apply_exp_scale=False でテストして、
+        #    スプラットが異常に小さい/大きい場合は True を試す
+        if apply_exp_scale:
+            scales = np.exp(scales)
+        
         # For GLSL, we keep rotations as Quaternions (or decode them).
         # The decode_rotation function returns (x, y, z, w)
         quats_np = decode_rotation(rots_u)
         
         # We also return Eulers for the Mesh fallback/Render chunks
         eulers = quaternion_to_euler_numpy(quats_np)
-            
-        return colors, scales, quats_np, eulers
+
+        # Optional opacity decode from reserved bytes (first uint16 slot)
+        opacity = None
+        if extra_u is not None and len(extra_u) > 0:
+            extra_u16 = extra_u.view(dtype=np.uint16).reshape(-1, 3)
+            op_raw = extra_u16[:, 0]
+
+            opacity_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'opacity'), None)
+            if opacity_meta:
+                def _scalar(v, default):
+                    if isinstance(v, (list, tuple, np.ndarray)):
+                        return float(v[0]) if len(v) > 0 else float(default)
+                    try:
+                        return float(v)
+                    except Exception:
+                        return float(default)
+                op_min = _scalar(opacity_meta.get('min', 0.0), 0.0)
+                op_max = _scalar(opacity_meta.get('max', 1.0), 1.0)
+            else:
+                op_min, op_max = 0.0, 1.0
+
+            if op_max != op_min:
+                opacity = op_min + (op_raw.astype(np.float32) / 65535.0) * (op_max - op_min)
+            else:
+                opacity = np.full_like(op_raw, op_min, dtype=np.float32)
+
+            # Multiply decoded alpha if available
+            colors[:, 3] *= opacity
+        
+        return colors, scales, quats_np, eulers, opacity
 
 # ------------------------------------------------------------------------
 # Blender Operator
@@ -275,6 +438,10 @@ class LCCParser:
 class IMPORT_OT_lcc(bpy.types.Operator):
     bl_idname = "import_scene.lcc"
     bl_label = "Import LCC (Split View/Render)"
+    bl_description = (
+        "Import LCC Data (Data Organization Format originated from XGRIDS). "
+        "See: https://github.com/xgrids/LCCWhitepaper"
+    )
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
@@ -344,7 +511,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         total_points = 0
         
         # Buffer for Viewport Object (Unified)
-        vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list = [], [], [], []
+        vp_pos_list, vp_col_list, vp_scl_list, vp_rot_list, vp_opa_list = [], [], [], [], []
         
         # Spatial Grid Buffer for Render Chunks
         # Key: (grid_x, grid_y, grid_z), Value: lists of (pos, col, scl, rot, lod)
@@ -356,10 +523,11 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 units = parser.get_lod_info(lvl)
                 if not units: continue
                 
-                for pos, col_u, scl_u, rot_u in parser.iter_chunks(units, batch_size=1000000):
+                for pos, col_u, scl_u, rot_u, extra_u in parser.iter_chunks(units, batch_size=1000000):
                     # Decode
                     # Note: decode_attributes now returns quats AND eulers
-                    col, scl, quats, eulers = parser.decode_attributes(col_u, scl_u, rot_u)
+                    # apply_exp_scale=False がデフォルト。スプラットサイズが異常な場合は True を試す
+                    col, scl, quats, eulers, opacity = parser.decode_attributes(col_u, scl_u, rot_u, extra_u=extra_u, apply_exp_scale=False)
                     
                     # --- 1. Binning for Render Chunks (Grid Split) ---
                     # Calculate grid indices for each point
@@ -376,12 +544,14 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         
                         key = (gx, gy, gz)
                         if key not in spatial_chunks:
-                            spatial_chunks[key] = {'pos': [], 'col': [], 'scl': [], 'rot': [], 'lod': []}
+                            spatial_chunks[key] = {'pos': [], 'col': [], 'scl': [], 'rot': [], 'lod': [], 'opa': []}
                         
                         spatial_chunks[key]['pos'].append(pos[mask])
                         spatial_chunks[key]['col'].append(col[mask])
                         spatial_chunks[key]['scl'].append(scl[mask])
                         spatial_chunks[key]['rot'].append(eulers[mask]) # Use Eulers for Geometry Nodes
+                        if opacity is not None:
+                            spatial_chunks[key]['opa'].append(opacity[mask])
                         # Store LOD level for each point (since chunks can mix LODs now)
                         spatial_chunks[key]['lod'].append(np.full(np.sum(mask), lvl, dtype=np.int32))
 
@@ -397,11 +567,15 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                             vp_col_list.append(col[mask])
                             vp_scl_list.append(scl[mask])
                             vp_rot_list.append(quats[mask]) # Use Quaternions for GLSL
+                            if opacity is not None:
+                                vp_opa_list.append(opacity[mask])
                     else:
                         vp_pos_list.append(pos)
                         vp_col_list.append(col)
                         vp_scl_list.append(scl)
                         vp_rot_list.append(quats) # Use Quaternions for GLSL
+                        if opacity is not None:
+                            vp_opa_list.append(opacity)
         
         # Apply RENDER Geometry Nodes (LOD Logic)
             # Create Render Chunks from Spatial Grid
@@ -421,6 +595,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 c_scl = np.concatenate(data['scl'])
                 c_rot = np.concatenate(data['rot'])
                 c_lod = np.concatenate(data['lod'])
+                c_opa = np.concatenate(data['opa']) if data['opa'] else None
                 
                 # Culling Logic
                 should_hide = False
@@ -435,7 +610,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     if dist > self.culling_distance:
                         should_hide = True
                 
-                self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod, hide_render_force=should_hide)
+                self.create_render_chunk(render_coll, chunk_name, c_pos, c_col, c_scl, c_rot, c_lod, opacities=c_opa, hide_render_force=should_hide)
 
             # Create Unified Viewport Object OR GLSL Renderer
             if vp_pos_list:
@@ -443,6 +618,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 vp_col = np.concatenate(vp_col_list)
                 vp_scl = np.concatenate(vp_scl_list)
                 vp_rot = np.concatenate(vp_rot_list)
+                vp_opa = np.concatenate(vp_opa_list) if vp_opa_list else None
                 
                 print(f"DEBUG: use_glsl={self.use_glsl}, LCCGLSLRenderer_Class={LCCGLSLRenderer}")
                 if LCCGLSLRenderer is None:
@@ -492,7 +668,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     else:
                         viewport_coll = bpy.data.collections[viewport_coll_name]
                         
-                    self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_euler)
+                    self.create_viewport_object(viewport_coll, vp_pos, vp_col, vp_scl, vp_euler, opacities=vp_opa)
                     print(f"Viewport Proxy Created: {len(vp_pos)} points.")
                 
         except Exception as e:
@@ -529,18 +705,21 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
                 if should_sort:
                     glsl_renderer.sort_and_update(cam_pos)
+
+                # ← ここで描画
+                glsl_renderer.draw()
             except Exception as e:
-                self.report({'ERROR'}, f"Error in draw_callback: {str(e)}")
+                print(f"[LCC] Error in draw_callback: {e}")
                 import traceback
                 traceback.print_exc()
                 
-    def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, hide_render_force=False):
+    def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, opacities=None, hide_render_force=False):
         mesh = bpy.data.meshes.new(name=chunk_name)
         num_points = len(positions)
         mesh.vertices.add(num_points)
         mesh.vertices.foreach_set("co", positions.flatten())
         
-        self._add_attributes(mesh, colors, scales, rots, lod_levels)
+        self._add_attributes(mesh, colors, scales, rots, lod_levels, opacities=opacities)
         
         obj = bpy.data.objects.new(chunk_name, mesh)
         collection.objects.link(obj)
@@ -557,7 +736,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         # Apply RENDER Geometry Nodes (LOD Logic)
         self.create_render_geonodes(obj, self.scale_density, self.min_thickness, self.lod_distance)
 
-    def create_viewport_object(self, collection, positions, colors, scales, rots):
+    def create_viewport_object(self, collection, positions, colors, scales, rots, opacities=None):
         """Creates a unified object for VIEWPORT ONLY (Hidden in Render)"""
         mesh_name = "LCC_Viewport_Proxy"
         mesh = bpy.data.meshes.new(name=mesh_name)
@@ -567,7 +746,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         mesh.vertices.foreach_set("co", positions.flatten())
         
         # Viewport proxy doesn't need LOD level attribute essentially, but keeping structure
-        self._add_attributes(mesh, colors, scales, rots, 0)
+        self._add_attributes(mesh, colors, scales, rots, 0, opacities=opacities)
         
         obj = bpy.data.objects.new(mesh_name, mesh)
         collection.objects.link(obj)
@@ -579,7 +758,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         # Apply VIEWPORT Geometry Nodes (Simple Display)
         self.create_viewport_geonodes(obj, self.scale_density, self.min_thickness)
 
-    def _add_attributes(self, mesh, colors, scales, rots, lod_data):
+    def _add_attributes(self, mesh, colors, scales, rots, lod_data, opacities=None):
         attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')
         attr_col.data.foreach_set("color", colors.flatten())
         
@@ -588,6 +767,10 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         attr_rot = mesh.attributes.new(name="SplatRotation", type='FLOAT_VECTOR', domain='POINT')
         attr_rot.data.foreach_set("vector", rots.flatten())
+
+        if opacities is not None:
+            attr_opa = mesh.attributes.new(name="SplatOpacity", type='FLOAT', domain='POINT')
+            attr_opa.data.foreach_set("value", np.asarray(opacities, dtype=np.float32))
         
         attr_lod = mesh.attributes.new(name="SplatLOD", type='INT', domain='POINT')
         
@@ -908,6 +1091,172 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
+    """GLSL 3DGS を使った軽量 360°プレビュー連番出力"""
+    bl_idname = "lcc.render_360_preview_glsl"
+    bl_label = "Render 360 Preview (GLSL)"
+    bl_options = {'REGISTER'}
+
+    width: bpy.props.IntProperty(
+        name="Width",
+        default=2048,
+        min=256,
+        max=8192,
+    )
+    height: bpy.props.IntProperty(
+        name="Height",
+        default=1024,
+        min=128,
+        max=4096,
+    )
+    frame_start: bpy.props.IntProperty(
+        name="Start Frame",
+        default=1,
+        min=1,
+    )
+    frame_end: bpy.props.IntProperty(
+        name="End Frame",
+        default=90,
+        min=1,
+    )
+    face_size: bpy.props.IntProperty(
+        name="Face Size",
+        default=512,
+        min=64,
+        max=4096,
+        description="キューブマップ1面の解像度 (未設定なら width/4 を自動使用)"
+    )
+    output_dir: bpy.props.StringProperty(
+        name="Output Directory",
+        subtype='DIR_PATH',
+        default="//LCC_360_Preview/"
+    )
+
+    def execute(self, context):
+        global glsl_renderer
+        if glsl_renderer is None:
+            self.report({'ERROR'}, "GLSL Renderer が初期化されていません（Import LCC で 'Use GLSL Viewport' を有効にして読み込み直してください）。")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        cam = scene.camera
+        if cam is None:
+            self.report({'ERROR'}, "シーンにアクティブカメラがありません。")
+            return {'CANCELLED'}
+
+        width = self.width
+        height = self.height
+        face_size = self.face_size if self.face_size > 0 else max(64, width // 4)
+
+        import os
+        out_dir = bpy.path.abspath(self.output_dir)
+        
+        # 相対パスのまま／権限エラーになった場合は安全な場所にフォールバック
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except PermissionError:
+            # .blend が保存されていればそのフォルダ配下、なければユーザーディレクトリ
+            fallback_root = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else os.path.expanduser("~")
+            out_dir = os.path.join(fallback_root, "LCC_360_Preview")
+            os.makedirs(out_dir, exist_ok=True)
+            print(f"[LCC] PermissionError: fallback to {out_dir}")
+
+        offscreen = gpu.types.GPUOffScreen(face_size, face_size)
+
+        # キューブマップ 6 面の方向（ローカル軸基準）
+        face_defs = {
+            'PX': (Vector((1, 0, 0)),  Vector((0, -1, 0))),
+            'NX': (Vector((-1, 0, 0)), Vector((0, -1, 0))),
+            'PY': (Vector((0, 1, 0)),  Vector((0, 0, 1))),
+            'NY': (Vector((0, -1, 0)), Vector((0, 0, -1))),
+            'PZ': (Vector((0, 0, 1)),  Vector((0, -1, 0))),
+            'NZ': (Vector((0, 0, -1)), Vector((0, -1, 0))),
+        }
+
+        try:
+            for frame in range(self.frame_start, self.frame_end + 1):
+                scene.frame_set(frame)
+
+                # カメラ位置と向き
+                cam_mw = cam.matrix_world
+                eye = cam_mw.translation
+                basis = cam_mw.to_3x3()
+
+                faces_np = {}
+
+                for key, (dir_local, up_local) in face_defs.items():
+                    # カメラローカル → ワールド方向
+                    dir_world = basis @ dir_local
+                    up_world = basis @ up_local
+
+                    # この面の「見る方向」
+                    target = eye + dir_world
+
+                    # ここで view / projection 行列を作る
+                    view_matrix = make_lookat(eye, target, up_world)
+                    proj_matrix = make_perspective(
+                        math.radians(90.0),  # 90度のFOV
+                        aspect=1.0,
+                        z_near=0.1,
+                        z_far=1000.0,
+                    )
+
+                    # OffScreen にバインドして描画
+                    with offscreen.bind():
+                        # 現在アクティブなフレームバッファを取得
+                        framebuffer = gpu.state.active_framebuffer_get()
+
+                        # 深度・ブレンド等のステート設定
+                        gpu.state.depth_mask_set(True)
+                        gpu.state.depth_test_set('LESS_EQUAL')  # 必要なら 'LESS' でもOK
+                        gpu.state.blend_set('ALPHA_PREMULT')
+
+                        # カラー & 深度をクリア（Blender 4.5 推奨スタイル）
+                        framebuffer.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
+
+                        # ここから実際の 3DGS 描画
+                        glsl_renderer.draw_offscreen(view_matrix, proj_matrix, face_size, face_size)
+
+                        # カラーバッファを読み出し（framebuffer から）
+                        buf = framebuffer.read_color(0, 0, face_size, face_size, 4, 0, 'UBYTE')
+
+                    # memoryview → バイト列にして 1次元連続バッファに変換
+                    buf_bytes = bytes(buf)
+
+                    # numpy 配列に変換して (H, W, 4) に reshape
+                    img_np = np.frombuffer(buf_bytes, dtype=np.uint8)
+                    img_np = img_np.reshape((face_size, face_size, 4))
+
+                    # faces_np に格納
+                    faces_np[key] = img_np
+
+                # 6 面 → equirect
+                equirect = cubemap_to_equirect(faces_np, width, height)
+
+                # Blender Image 経由で PNG 保存
+                img = bpy.data.images.new(
+                    name=f"LCC_360_preview_{frame:04d}",
+                    width=width,
+                    height=height,
+                    alpha=True,
+                    float_buffer=False,
+                )
+                # RGBA [0,1] に正規化して pixels へ
+                pixels = (equirect.astype(np.float32) / 255.0).reshape(-1)
+                img.pixels = pixels.tolist()
+
+                filepath = os.path.join(out_dir, f"frame_{frame:04d}.png")
+                img.filepath_raw = filepath
+                img.file_format = 'PNG'
+                img.save()
+                bpy.data.images.remove(img)
+
+            self.report({'INFO'}, f"GLSL 360 Preview を {out_dir} に出力しました。")
+        finally:
+            offscreen.free()
+
+        return {'FINISHED'}
+
 class LCC_PT_Panel(bpy.types.Panel):
     bl_label = "LCC Tools (Split View/Render)"
     bl_idname = "LCC_PT_Panel"
@@ -919,7 +1268,15 @@ class LCC_PT_Panel(bpy.types.Panel):
         layout = self.layout
         layout.operator("import_scene.lcc", text="Import LCC (.lcc)")
 
-classes = (IMPORT_OT_lcc, LCC_PT_Panel)
+        col = layout.box()
+        col.label(text="GLSL 360 Preview", icon='RENDER_STILL')
+        col.operator("lcc.render_360_preview_glsl", text="Render 360 Preview (GLSL)")
+
+classes = (
+    IMPORT_OT_lcc,
+    LCC_OT_render_360_preview_glsl,
+    LCC_PT_Panel,
+)
 
 def register():
     for cls in classes:
