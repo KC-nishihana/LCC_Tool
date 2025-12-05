@@ -374,40 +374,44 @@ class LCCParser:
         return (positions + self.meta_offset + self.meta_shift) * self.meta_scale
 
     def decode_attributes(self, colors_u, scales_u, rots_u, extra_u=None, apply_exp_scale=False):
+        """Decode packed attributes. Opacity is applied only when non-zero data exists."""
+
+        # RGBA8 -> float (0..1)
         colors = colors_u.view(dtype=np.uint8).reshape(-1, 4).astype(np.float32) / 255.0
-        
+
+        # Scale decode
         scale_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'scale'), None)
         if scale_meta:
             s_min = np.array(scale_meta['min'], dtype=np.float32)
             s_max = np.array(scale_meta['max'], dtype=np.float32)
         else:
-            s_min = np.array([0,0,0], dtype=np.float32)
-            s_max = np.array([1,1,1], dtype=np.float32)
-            
+            s_min = np.array([0, 0, 0], dtype=np.float32)
+            s_max = np.array([1, 1, 1], dtype=np.float32)
+
         scales_norm = scales_u.astype(np.float32) / 65535.0
         scales = s_min + scales_norm * (s_max - s_min)
-        
-        # In 3DGS the scale is stored in log space; apply_exp_scale reverts it.
-        # Leave apply_exp_scale=False for LCC defaults. Turn it on only when
-        # the source data is known to be log-scaled (e.g., some 3DGS exports).
+
+        # Optional: revert log scale (3DGS export) only when requested
         if apply_exp_scale:
             scales = np.exp(scales)
-        
-        # For GLSL, we keep rotations as Quaternions (or decode them).
-        # The decode_rotation function returns (x, y, z, w)
+
+        # Rotation decode
         quats_np = decode_rotation(rots_u)
-        
-        # We also return Eulers for the Mesh fallback/Render chunks
         eulers = quaternion_to_euler_numpy(quats_np)
 
-        # Optional opacity decode from reserved bytes (first uint16 slot)
+        # Optional opacity from reserved bytes (first uint16 slot)
         opacity = None
         if extra_u is not None and len(extra_u) > 0:
             extra_u16 = extra_u.view(dtype=np.uint16).reshape(-1, 3)
             op_raw = extra_u16[:, 0]
 
-            opacity_meta = next((a for a in self.meta.get('attributes', []) if a['name'] == 'opacity'), None)
-            if opacity_meta:
+            # Ignore if entirely zero (means opacity is unused in the source)
+            if np.any(op_raw):
+                opacity_meta = next(
+                    (a for a in self.meta.get('attributes', []) if a['name'] == 'opacity'),
+                    None
+                )
+
                 def _scalar(v, default):
                     if isinstance(v, (list, tuple, np.ndarray)):
                         return float(v[0]) if len(v) > 0 else float(default)
@@ -415,19 +419,26 @@ class LCCParser:
                         return float(v)
                     except Exception:
                         return float(default)
-                op_min = _scalar(opacity_meta.get('min', 0.0), 0.0)
-                op_max = _scalar(opacity_meta.get('max', 1.0), 1.0)
-            else:
-                op_min, op_max = 0.0, 1.0
 
-            if op_max != op_min:
-                opacity = op_min + (op_raw.astype(np.float32) / 65535.0) * (op_max - op_min)
-            else:
-                opacity = np.full_like(op_raw, op_min, dtype=np.float32)
+                if opacity_meta:
+                    op_min = _scalar(opacity_meta.get('min', 0.0), 0.0)
+                    op_max = _scalar(opacity_meta.get('max', 1.0), 1.0)
+                else:
+                    op_min, op_max = 0.0, 1.0
 
-            # Multiply decoded alpha if available
-            colors[:, 3] *= opacity
-        
+                if op_max != op_min:
+                    opacity = op_min + (op_raw.astype(np.float32) / 65535.0) * (op_max - op_min)
+                else:
+                    opacity = np.full_like(op_raw, op_min, dtype=np.float32)
+
+                # Apply alpha modulation only when opacity is present
+                colors[:, 3] *= opacity
+
+        # Safety: if alpha collapsed to (near) zero everywhere, fall back to fully opaque
+        if np.all(colors[:, 3] <= 1e-3):
+            colors[:, 3] = 1.0
+            opacity = None
+
         return colors, scales, quats_np, eulers, opacity
 
 # ------------------------------------------------------------------------
@@ -577,6 +588,11 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                             vp_opa_list.append(opacity)
         
         # Apply RENDER Geometry Nodes (LOD Logic)
+            # Recenter all data near origin to avoid huge world coordinates
+            spatial_chunks, vp_pos_list, origin_offset = self._recenter_to_origin(
+                spatial_chunks, vp_pos_list, render_coll
+            )
+
             # Create Render Chunks from Spatial Grid
             print(f"Creating {len(spatial_chunks)} Spatial Render Chunks...")
             
@@ -598,12 +614,10 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
                 # Culling Logic
                 should_hide = False
-                if self.culling_distance > 0:
-                    # Calculate Chunk Center
-                    center_x = (gx + 0.5) * chunk_grid_size
-                    center_y = (gy + 0.5) * chunk_grid_size
-                    center_z = (gz + 0.5) * chunk_grid_size
-                    chunk_center = Vector((center_x, center_y, center_z))
+                if self.culling_distance > 0 and len(c_pos) > 0:
+                    # Use actual point centroid (already recentered) for distance test
+                    center_np = c_pos.mean(axis=0)
+                    chunk_center = Vector(center_np.tolist())
                     
                     dist = (chunk_center - cam_loc).length
                     if dist > self.culling_distance:
@@ -756,6 +770,36 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         # Apply VIEWPORT Geometry Nodes (Simple Display)
         self.create_viewport_geonodes(obj, self.scale_density, self.min_thickness)
+
+    def _recenter_to_origin(self, spatial_chunks, vp_pos_list, render_coll):
+        """Shift all positions so the scene is centered near the origin and store the offset."""
+        if not spatial_chunks:
+            return spatial_chunks, vp_pos_list, None
+
+        all_pos = []
+        for data in spatial_chunks.values():
+            for arr in data['pos']:
+                if arr is not None and arr.size > 0:
+                    all_pos.append(arr)
+
+        if not all_pos:
+            return spatial_chunks, vp_pos_list, None
+
+        all_pos = np.concatenate(all_pos, axis=0)
+        bb_min = all_pos.min(axis=0)
+        bb_max = all_pos.max(axis=0)
+        origin_offset = (bb_min + bb_max) * 0.5
+
+        for data in spatial_chunks.values():
+            data['pos'] = [arr - origin_offset for arr in data['pos']]
+
+        if vp_pos_list:
+            vp_pos_list = [arr - origin_offset for arr in vp_pos_list]
+
+        # Keep world offset so original coordinates can be recovered later
+        render_coll["lcc_world_offset"] = origin_offset.tolist()
+
+        return spatial_chunks, vp_pos_list, origin_offset
 
     def _add_attributes(self, mesh, colors, scales, rots, lod_data, opacities=None):
         attr_col = mesh.attributes.new(name="SplatColor", type='FLOAT_COLOR', domain='POINT')

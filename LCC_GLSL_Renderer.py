@@ -166,7 +166,8 @@ void main() {
     
     if (final_alpha < 0.01) discard;
     
-    fragColor = vec4(vColor.rgb, final_alpha);
+    // Premultiply color to match ALPHA_PREMULT blend state
+    fragColor = vec4(vColor.rgb * final_alpha, final_alpha);
 }
 """
 
