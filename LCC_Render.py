@@ -482,6 +482,23 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     
     use_glsl: bpy.props.BoolProperty(name="Use GLSL Viewport", default=True, description="Use high-performance OpenGL renderer for viewport")
 
+    # 3DGS compatibility
+    use_3dgs_attributes: bpy.props.BoolProperty(
+        name="Use 3DGS Attributes",
+        default=False,
+        description="Write 3DGS-compatible vertex attributes (f_dc_*, scale_*, rot_*, opacity) and attach an existing Gaussian Splatting node group"
+    )
+    g3ds_node_group: bpy.props.StringProperty(
+        name="3DGS Node Group",
+        default="Gaussian splatting",
+        description="Existing Geometry Nodes group that consumes 3DGS PLY attributes"
+    )
+    rot_wxyz: bpy.props.BoolProperty(
+        name="Rotation WXYZ order",
+        default=False,
+        description="When enabled, rot_0..3 are stored as w,x,y,z (instead of x,y,z,w)"
+    )
+
     def execute(self, context):
         if not self.filepath.lower().endswith(".lcc"):
             self.report({'ERROR'}, "Please select an .lcc file.")
@@ -537,7 +554,13 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                     # Decode
                     # Note: decode_attributes now returns quats AND eulers
                     # apply_exp_scale=False keeps LCC default scale; set True only if the source was log-scaled
-                    col, scl, quats, eulers, opacity = parser.decode_attributes(col_u, scl_u, rot_u, extra_u=extra_u, apply_exp_scale=False)
+                    col, scl, quats, eulers, opacity = parser.decode_attributes(
+                        col_u,
+                        scl_u,
+                        rot_u,
+                        extra_u=extra_u,
+                        apply_exp_scale=self.use_3dgs_attributes,
+                    )
                     
                     # --- 1. Binning for Render Chunks (Grid Split) ---
                     # Calculate grid indices for each point
@@ -559,7 +582,9 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         spatial_chunks[key]['pos'].append(pos[mask])
                         spatial_chunks[key]['col'].append(col[mask])
                         spatial_chunks[key]['scl'].append(scl[mask])
-                        spatial_chunks[key]['rot'].append(eulers[mask]) # Use Eulers for Geometry Nodes
+                        # Store quats when targeting 3DGS attributes, otherwise Eulers for legacy GN
+                        rot_payload = quats[mask] if self.use_3dgs_attributes else eulers[mask]
+                        spatial_chunks[key]['rot'].append(rot_payload)
                         if opacity is not None:
                             spatial_chunks[key]['opa'].append(opacity[mask])
                         # Store LOD level for each point (since chunks can mix LODs now)
@@ -592,6 +617,43 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             spatial_chunks, vp_pos_list, origin_offset = self._recenter_to_origin(
                 spatial_chunks, vp_pos_list, render_coll
             )
+
+            # If 3DGS-compatible export is requested, skip custom GN and build a single mesh with 3DGS attrs
+            if self.use_3dgs_attributes:
+                pos_all, col_all, scl_all, rot_all, opa_all = [], [], [], [], []
+                for data in spatial_chunks.values():
+                    if data['pos']: pos_all.append(np.concatenate(data['pos']))
+                    if data['col']: col_all.append(np.concatenate(data['col']))
+                    if data['scl']: scl_all.append(np.concatenate(data['scl']))
+                    if data['rot']: rot_all.append(np.concatenate(data['rot']))
+                    if data['opa']: opa_all.append(np.concatenate(data['opa']))
+
+                if not pos_all:
+                    self.report({'WARNING'}, "No points found for 3DGS export.")
+                    return {'CANCELLED'}
+
+                pos_all = np.concatenate(pos_all)
+                col_all = np.concatenate(col_all) if col_all else np.zeros((len(pos_all),4), dtype=np.float32)
+                scl_all = np.concatenate(scl_all) if scl_all else np.ones((len(pos_all),3), dtype=np.float32)
+                rot_all = np.concatenate(rot_all) if rot_all else np.zeros((len(pos_all),4), dtype=np.float32)
+                opa_all = np.concatenate(opa_all) if opa_all else np.ones((len(pos_all),), dtype=np.float32)
+
+                obj_name = "LCC_3DGS"
+                obj = self._create_3dgs_object(
+                    render_coll,
+                    obj_name,
+                    pos_all,
+                    col_all,
+                    scl_all,
+                    rot_all,
+                    opa_all,
+                    origin_offset,
+                    self.g3ds_node_group,
+                    self.rot_wxyz,
+                )
+
+                # Skip legacy render/viewport paths when 3DGS is used
+                return {'FINISHED'}
 
             # Create Render Chunks from Spatial Grid
             print(f"Creating {len(spatial_chunks)} Spatial Render Chunks...")
@@ -825,6 +887,73 @@ class IMPORT_OT_lcc(bpy.types.Operator):
              
         attr_lod.data.foreach_set("value", final_lod_data)
 
+    def _add_attributes_3dgs(self, mesh, colors, scales, quats, opacities=None, use_wxyz=False, add_log_opacity=True):
+        """Populate mesh attributes following 3DGS PLY conventions."""
+        Y00 = 0.28209479177387814
+
+        # DC color coefficients
+        f_dc = colors[:, :3].astype(np.float32) / Y00
+        dc0 = mesh.attributes.new("f_dc_0", 'FLOAT', 'POINT')
+        dc1 = mesh.attributes.new("f_dc_1", 'FLOAT', 'POINT')
+        dc2 = mesh.attributes.new("f_dc_2", 'FLOAT', 'POINT')
+        dc0.data.foreach_set("value", f_dc[:, 0])
+        dc1.data.foreach_set("value", f_dc[:, 1])
+        dc2.data.foreach_set("value", f_dc[:, 2])
+
+        # Opacity
+        opa = opacities if opacities is not None else np.ones(len(mesh.vertices), dtype=np.float32)
+        opa_attr = mesh.attributes.new("opacity", 'FLOAT', 'POINT')
+        opa_attr.data.foreach_set("value", np.asarray(opa, dtype=np.float32))
+
+        if add_log_opacity:
+            log_attr = mesh.attributes.new("log_opacity", 'FLOAT', 'POINT')
+            log_attr.data.foreach_set("value", np.log(np.clip(np.asarray(opa, dtype=np.float32), 1e-6, 1.0)))
+
+        # Scales (assumed already decoded; caller can exp() before calling if needed)
+        s0 = mesh.attributes.new("scale_0", 'FLOAT', 'POINT')
+        s1 = mesh.attributes.new("scale_1", 'FLOAT', 'POINT')
+        s2 = mesh.attributes.new("scale_2", 'FLOAT', 'POINT')
+        s0.data.foreach_set("value", scales[:, 0].astype(np.float32))
+        s1.data.foreach_set("value", scales[:, 1].astype(np.float32))
+        s2.data.foreach_set("value", scales[:, 2].astype(np.float32))
+
+        # Rotations
+        q = quats.astype(np.float32)
+        if use_wxyz and q.shape[1] >= 4:
+            rot = np.stack([q[:, 3], q[:, 0], q[:, 1], q[:, 2]], axis=1)
+        else:
+            rot = q
+
+        r0 = mesh.attributes.new("rot_0", 'FLOAT', 'POINT')
+        r1 = mesh.attributes.new("rot_1", 'FLOAT', 'POINT')
+        r2 = mesh.attributes.new("rot_2", 'FLOAT', 'POINT')
+        r3 = mesh.attributes.new("rot_3", 'FLOAT', 'POINT')
+        r0.data.foreach_set("value", rot[:, 0])
+        r1.data.foreach_set("value", rot[:, 1])
+        r2.data.foreach_set("value", rot[:, 2])
+        r3.data.foreach_set("value", rot[:, 3])
+
+    def _create_3dgs_object(self, collection, name, positions, colors, scales, quats, opacities, origin_offset, node_group_name, use_wxyz):
+        mesh = bpy.data.meshes.new(name)
+        mesh.vertices.add(len(positions))
+        mesh.vertices.foreach_set("co", positions.astype(np.float32).flatten())
+
+        self._add_attributes_3dgs(mesh, colors, scales, quats, opacities=opacities, use_wxyz=use_wxyz)
+
+        obj = bpy.data.objects.new(name, mesh)
+        collection.objects.link(obj)
+
+        if origin_offset is not None:
+            obj["lcc_offset"] = np.asarray(origin_offset, dtype=float).tolist()
+
+        if node_group_name and node_group_name in bpy.data.node_groups:
+            mod = obj.modifiers.new(name="3DGS", type='NODES')
+            mod.node_group = bpy.data.node_groups[node_group_name]
+        else:
+            print(f"[LCC] Node group '{node_group_name}' not found. Please assign manually.")
+
+        return obj
+
     def cleanup_old_objects(self):
         # Cleanup objects and collections
         collections_to_remove = ["LCC_Render", "LCC_Viewport", "LCC_Imported"]
@@ -984,16 +1113,10 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         if selection_socket:
             links.new(selection_socket, instance_on_points.inputs['Selection'])
-        
-        if high_detail:
-            # Use IcoSphere for better shape detail (Render)
-            mesh_node = nodes.new('GeometryNodeMeshIcoSphere')
-            mesh_node.inputs['Radius'].default_value = 1.0
-            mesh_node.inputs['Subdivisions'].default_value = 3
-        else:
-            # Use Cube for performance (Viewport)
-            mesh_node = nodes.new('GeometryNodeMeshCube')
-            mesh_node.inputs['Size'].default_value = (2.0, 2.0, 2.0)
+
+        # Use Cube for both render and viewport; final size is driven by SplatScale
+        mesh_node = nodes.new('GeometryNodeMeshCube')
+        mesh_node.inputs['Size'].default_value = (2.0, 2.0, 2.0)
             
         mesh_node.location = (-200, -200)
         links.new(mesh_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
@@ -1033,18 +1156,19 @@ class IMPORT_OT_lcc(bpy.types.Operator):
 
     def _create_shader_nodes(self, mat):
         nt = mat.node_tree
-        for n in nt.nodes: nt.nodes.remove(n)
+        nt.nodes.clear()
         
         out_node = nt.nodes.new('ShaderNodeOutputMaterial')
         out_node.location = (800, 0)
         
         attr_node = nt.nodes.new('ShaderNodeAttribute')
-        attr_node.attribute_type = 'INSTANCER' 
-        attr_node.attribute_name = "viz_color" 
+        attr_node.attribute_type = 'INSTANCER'
+        attr_node.attribute_name = "viz_color"
         attr_node.location = (-800, 0)
         
         tex_coord = nt.nodes.new('ShaderNodeTexCoord')
         tex_coord.location = (-800, 300)
+        
         vec_math_dot = nt.nodes.new('ShaderNodeVectorMath')
         vec_math_dot.operation = 'DOT_PRODUCT'
         vec_math_dot.location = (-600, 300)
@@ -1053,7 +1177,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         math_mult_factor = nt.nodes.new('ShaderNodeMath')
         math_mult_factor.operation = 'MULTIPLY'
-        math_mult_factor.inputs[1].default_value = -1.5
+        math_mult_factor.inputs[1].default_value = -1.0  # k in exp(-k * r^2), adjust if needed
         math_mult_factor.location = (-400, 300)
         nt.links.new(vec_math_dot.outputs[0], math_mult_factor.inputs[0])
         
@@ -1070,7 +1194,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         
         math_threshold = nt.nodes.new('ShaderNodeMath')
         math_threshold.operation = 'GREATER_THAN'
-        math_threshold.inputs[1].default_value = 0.004
+        math_threshold.inputs[1].default_value = 0.001  # tighten/loosen to control holes
         math_threshold.location = (200, 300)
         nt.links.new(math_mult_alpha.outputs[0], math_threshold.inputs[0])
         
@@ -1079,17 +1203,17 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         math_masked_alpha.location = (400, 200)
         nt.links.new(math_mult_alpha.outputs[0], math_masked_alpha.inputs[0])
         nt.links.new(math_threshold.outputs[0], math_masked_alpha.inputs[1])
-        
+
         emission = nt.nodes.new('ShaderNodeEmission')
         emission.location = (400, 0)
         nt.links.new(attr_node.outputs['Color'], emission.inputs['Color'])
+        nt.links.new(math_masked_alpha.outputs[0], emission.inputs['Strength'])
         
         transparent = nt.nodes.new('ShaderNodeBsdfTransparent')
         transparent.location = (400, -100)
         
         mix_shader = nt.nodes.new('ShaderNodeMixShader')
         mix_shader.location = (600, 0)
-        
         nt.links.new(math_masked_alpha.outputs[0], mix_shader.inputs['Fac'])
         nt.links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
         nt.links.new(emission.outputs['Emission'], mix_shader.inputs[2])
