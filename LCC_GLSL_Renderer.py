@@ -285,49 +285,154 @@ class LCCGLSLRenderer:
     
     def sort_and_update(self, cam_pos):
         """Sort instances back-to-front based on camera position"""
-        # Sorting with textures requires re-uploading the textures.
-        # This can be expensive. Disabled for now.
-        pass
+        if self.num_instances == 0 or not hasattr(self, 'original_pos'):
+            return
+        
+        try:
+            # カメラ位置との距離を計算
+            cam_pos_np = np.array([cam_pos.x, cam_pos.y, cam_pos.z], dtype=np.float32)
+            distances = np.linalg.norm(self.original_pos - cam_pos_np, axis=1)
+            
+            # 遠い順（奥→手前）にソート
+            sorted_indices = np.argsort(-distances)
+            
+            # データを並び替え
+            sorted_pos = self.original_pos[sorted_indices]
+            sorted_col = self.original_col[sorted_indices]
+            sorted_scl = self.original_scl[sorted_indices]
+            sorted_rot = self.original_rot[sorted_indices]
+            
+            # テクスチャを再作成
+            if self.pos_tex:
+                del self.pos_tex
+            if self.col_tex:
+                del self.col_tex
+            if self.scl_tex:
+                del self.scl_tex
+            if self.rot_tex:
+                del self.rot_tex
+            
+            self.pos_tex = self._create_data_texture(sorted_pos, self.tex_width)
+            self.col_tex = self._create_data_texture(sorted_col, self.tex_width)
+            self.scl_tex = self._create_data_texture(sorted_scl, self.tex_width)
+            self.rot_tex = self._create_data_texture(sorted_rot, self.tex_width)
+            
+            # ソート後のデータを保存（次回のソート用）
+            self.original_pos = sorted_pos
+            self.original_col = sorted_col
+            self.original_scl = sorted_scl
+            self.original_rot = sorted_rot
+            
+        except Exception as e:
+            print(f"Warning: Failed to sort instances: {e}")
 
     def draw(self):
         if not self.batch or not self.shader:
             return
+        
+        # ---- GPU State の保存と設定 ----
+        prev_blend = gpu.state.blend_get()
+        prev_depth_test = gpu.state.depth_test_get()
+        prev_depth_write = gpu.state.depth_mask_get()
+        
+        # 半透明スプラット用の設定
+        gpu.state.blend_set('ALPHA_PREMULT')  # Pre-multiplied alpha blending
+        gpu.state.depth_test_set('LESS_EQUAL')  # 深度テストを有効化
+        gpu.state.depth_mask_set(False)  # 深度書き込みは無効（半透明オブジェクト）
+        
+        try:
+            self.shader.bind()
             
-        self.shader.bind()
-        
-        # Context Data
-        region = bpy.context.region
-        region_data = bpy.context.region_data
-        
-        if not region_data:
-            return
+            # Context Data
+            region = bpy.context.region
+            region_data = bpy.context.region_data
+            
+            if not region_data:
+                return
 
-        # Matrices
-        view_matrix = region_data.view_matrix
-        projection_matrix = region_data.window_matrix
+            # Matrices
+            view_matrix = region_data.view_matrix
+            # perspective_matrix = window_matrix * view_matrix
+            # 射影変換用に perspective_matrix を使用
+            persp_matrix = region_data.perspective_matrix
+            projection_matrix = region_data.window_matrix  # シェーダには window_matrix を渡す
+            
+            width = region.width
+            height = region.height
+            
+            # fx, fy は perspective_matrix から計算
+            fx = persp_matrix[0][0] * width / 2.0
+            fy = persp_matrix[1][1] * height / 2.0
+            
+            # Uniforms
+            # viewProjectionMatrix はシェーダ側で未使用なので送らない
+            # self.shader.uniform_float("viewProjectionMatrix", projection_matrix @ view_matrix)
+            self.shader.uniform_float("viewMatrix", view_matrix)
+            self.shader.uniform_float("projectionMatrix", projection_matrix)
+            self.shader.uniform_float("viewportSize", Vector((width, height)))
+            self.shader.uniform_float("focal", Vector((fx, fy)))
+            self.shader.uniform_int("texWidth", self.tex_width)
+            
+            # Bind Textures
+            if self.pos_tex: self.shader.uniform_sampler("posTex", self.pos_tex)
+            if self.colorTex: self.shader.uniform_sampler("colorTex", self.col_tex)
+            if self.scaleTex: self.shader.uniform_sampler("scaleTex", self.scl_tex)
+            if self.rotTex: self.shader.uniform_sampler("rotTex", self.rot_tex)
+            
+            # Draw
+            self.batch.draw_instanced(self.shader)
+        finally:
+            # ---- GPU State を元に戻す ----
+            gpu.state.blend_set(prev_blend)
+            gpu.state.depth_test_set(prev_depth_test)
+            gpu.state.depth_mask_set(prev_depth_write)
+
+    def draw_offscreen(self, view_matrix, projection_matrix, width, height):
+        """
+        現在 bind されているフレームバッファに対して、
+        渡された view/projection 行列とビューポートサイズで描画する。
+        OffScreen 360° レンダリング用。
+        """
+        if not self.batch or not self.shader:
+            return
         
-        width = region.width
-        height = region.height
+        # ---- GPU State の保存と設定 ----
+        prev_blend = gpu.state.blend_get()
+        prev_depth_test = gpu.state.depth_test_get()
+        prev_depth_write = gpu.state.depth_mask_get()
         
-        fx = projection_matrix[0][0] * width / 2.0
-        fy = projection_matrix[1][1] * height / 2.0
+        gpu.state.blend_set('ALPHA_PREMULT')
+        gpu.state.depth_test_set('LESS_EQUAL')
+        gpu.state.depth_mask_set(False)
         
-        # Uniforms
-        self.shader.uniform_float("viewProjectionMatrix", projection_matrix @ view_matrix)
-        self.shader.uniform_float("viewMatrix", view_matrix)
-        self.shader.uniform_float("projectionMatrix", projection_matrix)
-        self.shader.uniform_float("viewportSize", Vector((width, height)))
-        self.shader.uniform_float("focal", Vector((fx, fy)))
-        self.shader.uniform_int("texWidth", self.tex_width)
-        
-        # Bind Textures
-        if self.pos_tex: self.shader.uniform_sampler("posTex", self.pos_tex)
-        if self.colorTex: self.shader.uniform_sampler("colorTex", self.col_tex)
-        if self.scaleTex: self.shader.uniform_sampler("scaleTex", self.scl_tex)
-        if self.rotTex: self.shader.uniform_sampler("rotTex", self.rot_tex)
-        
-        # Draw
-        self.batch.draw_instanced(self.shader)
+        try:
+            self.shader.bind()
+
+            fx = projection_matrix[0][0] * width / 2.0
+            fy = projection_matrix[1][1] * height / 2.0
+
+            # self.shader.uniform_float("viewProjectionMatrix", projection_matrix @ view_matrix)
+            self.shader.uniform_float("viewMatrix", view_matrix)
+            self.shader.uniform_float("projectionMatrix", projection_matrix)
+            self.shader.uniform_float("viewportSize", Vector((width, height)))
+            self.shader.uniform_float("focal", Vector((fx, fy)))
+            self.shader.uniform_int("texWidth", self.tex_width)
+
+            if self.pos_tex:
+                self.shader.uniform_sampler("posTex", self.pos_tex)
+            if self.colorTex:
+                self.shader.uniform_sampler("colorTex", self.col_tex)
+            if self.scaleTex:
+                self.shader.uniform_sampler("scaleTex", self.scl_tex)
+            if self.rotTex:
+                self.shader.uniform_sampler("rotTex", self.rot_tex)
+
+            self.batch.draw_instanced(self.shader)
+        finally:
+            # ---- GPU State を元に戻す ----
+            gpu.state.blend_set(prev_blend)
+            gpu.state.depth_test_set(prev_depth_test)
+            gpu.state.depth_mask_set(prev_depth_write)
 
     # Helper properties for uniform binding names (avoiding typos)
     @property
