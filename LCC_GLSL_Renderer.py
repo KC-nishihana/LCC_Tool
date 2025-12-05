@@ -289,20 +289,20 @@ class LCCGLSLRenderer:
             return
         
         try:
-            # 繧ｫ繝｡繝ｩ菴咲ｽｮ縺ｨ縺ｮ霍晞屬繧定ｨ育ｮ・
+            # Convert camera to numpy for distance sort
             cam_pos_np = np.array([cam_pos.x, cam_pos.y, cam_pos.z], dtype=np.float32)
             distances = np.linalg.norm(self.original_pos - cam_pos_np, axis=1)
             
-            # 驕縺・・ｼ亥･･竊呈焔蜑搾ｼ峨↓繧ｽ繝ｼ繝・
+            # Back-to-front order for alpha blending
             sorted_indices = np.argsort(-distances)
             
-            # 繝・・繧ｿ繧剃ｸｦ縺ｳ譖ｿ縺・
+            # Apply ordering
             sorted_pos = self.original_pos[sorted_indices]
             sorted_col = self.original_col[sorted_indices]
             sorted_scl = self.original_scl[sorted_indices]
             sorted_rot = self.original_rot[sorted_indices]
             
-            # 繝・け繧ｹ繝√Ε繧貞・菴懈・
+            # Drop old textures before recreating
             if self.pos_tex:
                 del self.pos_tex
             if self.col_tex:
@@ -317,7 +317,7 @@ class LCCGLSLRenderer:
             self.scl_tex = self._create_data_texture(sorted_scl, self.tex_width)
             self.rot_tex = self._create_data_texture(sorted_rot, self.tex_width)
             
-            # 繧ｽ繝ｼ繝亥ｾ後・繝・・繧ｿ繧剃ｿ晏ｭ假ｼ域ｬ｡蝗槭・繧ｽ繝ｼ繝育畑・・
+            # Store sorted arrays for potential future resort
             self.original_pos = sorted_pos
             self.original_col = sorted_col
             self.original_scl = sorted_scl
@@ -330,15 +330,15 @@ class LCCGLSLRenderer:
         if not self.batch or not self.shader:
             return
         
-        # ---- GPU State 縺ｮ菫晏ｭ倥→險ｭ螳・----
+        # ---- Preserve GPU State ----
         prev_blend = gpu.state.blend_get()
         prev_depth_test = gpu.state.depth_test_get()
         prev_depth_write = gpu.state.depth_mask_get()
         
-        # 蜊企乗・繧ｹ繝励Λ繝・ヨ逕ｨ縺ｮ險ｭ螳・
+        # Configure blending for splats
         gpu.state.blend_set('ALPHA_PREMULT')  # Pre-multiplied alpha blending
-        gpu.state.depth_test_set('LESS_EQUAL')  # 豺ｱ蠎ｦ繝・せ繝医ｒ譛牙柑蛹・
-        gpu.state.depth_mask_set(False)  # 豺ｱ蠎ｦ譖ｸ縺崎ｾｼ縺ｿ縺ｯ辟｡蜉ｹ・亥濠騾乗・繧ｪ繝悶ず繧ｧ繧ｯ繝茨ｼ・
+        gpu.state.depth_test_set('LESS_EQUAL')  # Allow equal depth since splats accumulate
+        gpu.state.depth_mask_set(False)  # Disable depth writes for translucency
         
         try:
             self.shader.bind()
@@ -353,20 +353,18 @@ class LCCGLSLRenderer:
             # Matrices
             view_matrix = region_data.view_matrix
             # perspective_matrix = window_matrix * view_matrix
-            # 蟆・ｽｱ螟画鋤逕ｨ縺ｫ perspective_matrix 繧剃ｽｿ逕ｨ
             persp_matrix = region_data.perspective_matrix
-            projection_matrix = region_data.window_matrix  # 繧ｷ繧ｧ繝ｼ繝縺ｫ縺ｯ window_matrix 繧呈ｸ｡縺・
+            projection_matrix = region_data.window_matrix  # window_matrix already contains perspective
             
             width = region.width
             height = region.height
             
-            # fx, fy 縺ｯ perspective_matrix 縺九ｉ險育ｮ・
+            # fx, fy derived from perspective_matrix
             fx = persp_matrix[0][0] * width / 2.0
             fy = persp_matrix[1][1] * height / 2.0
             
             # Uniforms
-            # viewProjectionMatrix 縺ｯ繧ｷ繧ｧ繝ｼ繝蛛ｴ縺ｧ譛ｪ菴ｿ逕ｨ縺ｪ縺ｮ縺ｧ騾√ｉ縺ｪ縺・
-            # self.shader.uniform_float("viewProjectionMatrix", projection_matrix @ view_matrix)
+            # viewProjectionMatrix would be projection_matrix @ view_matrix
             self.shader.uniform_float("viewMatrix", view_matrix)
             self.shader.uniform_float("projectionMatrix", projection_matrix)
             self.shader.uniform_float("viewportSize", Vector((width, height)))
@@ -382,21 +380,20 @@ class LCCGLSLRenderer:
             # Draw
             self.batch.draw_instanced(self.shader)
         finally:
-            # ---- GPU State 繧貞・縺ｫ謌ｻ縺・----
+            # ---- Restore GPU State ----
             gpu.state.blend_set(prev_blend)
             gpu.state.depth_test_set(prev_depth_test)
             gpu.state.depth_mask_set(prev_depth_write)
 
     def draw_offscreen(self, view_matrix, projection_matrix, width, height):
         """
-        迴ｾ蝨ｨ bind 縺輔ｌ縺ｦ縺・ｋ繝輔Ξ繝ｼ繝繝舌ャ繝輔ぃ縺ｫ蟇ｾ縺励※縲・
-        貂｡縺輔ｌ縺・view/projection 陦悟・縺ｨ繝薙Η繝ｼ繝昴・繝医し繧､繧ｺ縺ｧ謠冗判縺吶ｋ縲・
-        OffScreen 360ﾂｰ 繝ｬ繝ｳ繝繝ｪ繝ｳ繧ｰ逕ｨ縲・
+        Render into the provided offscreen framebuffer with given view/projection
+        matrices. Used by the 360 preview path.
         """
         if not self.batch or not self.shader:
             return
         
-        # ---- GPU State 縺ｮ菫晏ｭ倥→險ｭ螳・----
+        # ---- Preserve GPU State ----
         prev_blend = gpu.state.blend_get()
         prev_depth_test = gpu.state.depth_test_get()
         prev_depth_write = gpu.state.depth_mask_get()
@@ -429,7 +426,7 @@ class LCCGLSLRenderer:
 
             self.batch.draw_instanced(self.shader)
         finally:
-            # ---- GPU State 繧貞・縺ｫ謌ｻ縺・----
+            # ---- Restore GPU State ----
             gpu.state.blend_set(prev_blend)
             gpu.state.depth_test_set(prev_depth_test)
             gpu.state.depth_mask_set(prev_depth_write)

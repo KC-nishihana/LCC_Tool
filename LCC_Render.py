@@ -145,8 +145,8 @@ def quaternion_to_euler_numpy(quats):
 
 def make_lookat(eye, target, up):
     """
-    OpenGL 鬚ｨ縺ｮ LookAt 陦悟・繧・mathutils.Matrix 縺ｧ逕滓・縲・
-    繧ｫ繝｡繝ｩ蜑肴婿 = -Z 縺ｫ縺ｪ繧九ｈ縺・↓讒区・縲・
+    OpenGL-style LookAt matrix built with mathutils.Matrix.
+    Camera forward is assumed to be -Z.
     """
     f = (target - eye).normalized()
     s = f.cross(up).normalized()
@@ -163,8 +163,8 @@ def make_lookat(eye, target, up):
 
 def make_perspective(fov_y_rad, aspect, z_near, z_far):
     """
-    OpenGL 莠呈鋤縺ｮ騾剰ｦ匁兜蠖ｱ陦悟・縲・
-    fov_y_rad: 繝ｩ繧ｸ繧｢繝ｳ
+    OpenGL-style perspective projection matrix.
+    fov_y_rad: vertical FOV in radians.
     """
     f = 1.0 / math.tan(fov_y_rad * 0.5)
     range_inv = 1.0 / (z_near - z_far)
@@ -179,9 +179,9 @@ def make_perspective(fov_y_rad, aspect, z_near, z_far):
 
 def cubemap_to_equirect(faces, width, height):
     """
-    faces: dict[str, np.ndarray] (PX, NX, PY, NY, PZ, NZ) 蜷・(N, N, 4) uint8
-    width, height: 蜃ｺ蜉・equirect 繧ｵ繧､繧ｺ
-    謌ｻ繧雁､: (height, width, 4) uint8
+    faces: dict[str, np.ndarray] (PX, NX, PY, NY, PZ, NZ) each (N, N, 4) uint8
+    width, height: output resolution of the equirectangular image
+    returns: (height, width, 4) uint8
     """
     out = np.zeros((height, width, 4), dtype=np.uint8)
     face_size = list(faces.values())[0].shape[0]
@@ -191,8 +191,8 @@ def cubemap_to_equirect(faces, width, height):
     v = (np.arange(height) + 0.5) / height
     uu, vv = np.meshgrid(u, v)
 
-    phi = uu * 2.0 * np.pi - np.pi        # 豌ｴ蟷ｳ: -pi ・・pi
-    theta = vv * np.pi - 0.5 * np.pi      # 蝙ら峩: -pi/2 ・・pi/2
+    phi = uu * 2.0 * np.pi - np.pi        # longitude: -pi .. pi
+    theta = vv * np.pi - 0.5 * np.pi      # latitude: -pi/2 .. pi/2
 
     x = np.cos(theta) * np.cos(phi)
     y = np.sin(theta)
@@ -207,7 +207,7 @@ def cubemap_to_equirect(faces, width, height):
         axis=-1
     )
 
-    # 蜷・擇縺斐→縺ｫ繝槭せ繧ｯ縺励※繧ｵ繝ｳ繝励Μ繝ｳ繧ｰ
+    # Helpers to sample from each cube face
     def sample_face(mask, sc, tc, face_key):
         if not np.any(mask):
             return
@@ -387,10 +387,9 @@ class LCCParser:
         scales_norm = scales_u.astype(np.float32) / 65535.0
         scales = s_min + scales_norm * (s_max - s_min)
         
-        # 3DGS 縺ｮ讓呎ｺ門ｮ溯｣・〒縺ｯ scale 縺・log 繧ｹ繧ｱ繝ｼ繝ｫ縺ｮ縺薙→縺悟､壹＞
-        # 蠢・ｦ√↓蠢懊§縺ｦ exp() 螟画鋤繧帝←逕ｨ
-        # 窶ｻ 縺ｾ縺壹・ apply_exp_scale=False 縺ｧ繝・せ繝医＠縺ｦ縲・
-        #    繧ｹ繝励Λ繝・ヨ縺檎焚蟶ｸ縺ｫ蟆上＆縺・螟ｧ縺阪＞蝣ｴ蜷医・ True 繧定ｩｦ縺・
+        # In 3DGS the scale is stored in log space; apply_exp_scale reverts it.
+        # Leave apply_exp_scale=False for LCC defaults. Turn it on only when
+        # the source data is known to be log-scaled (e.g., some 3DGS exports).
         if apply_exp_scale:
             scales = np.exp(scales)
         
@@ -526,7 +525,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 for pos, col_u, scl_u, rot_u, extra_u in parser.iter_chunks(units, batch_size=1000000):
                     # Decode
                     # Note: decode_attributes now returns quats AND eulers
-                    # apply_exp_scale=False 縺後ョ繝輔か繝ｫ繝医ゅせ繝励Λ繝・ヨ繧ｵ繧､繧ｺ縺檎焚蟶ｸ縺ｪ蝣ｴ蜷医・ True 繧定ｩｦ縺・
+                    # apply_exp_scale=False keeps LCC default scale; set True only if the source was log-scaled
                     col, scl, quats, eulers, opacity = parser.decode_attributes(col_u, scl_u, rot_u, extra_u=extra_u, apply_exp_scale=False)
                     
                     # --- 1. Binning for Render Chunks (Grid Split) ---
@@ -706,7 +705,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 if should_sort:
                     glsl_renderer.sort_and_update(cam_pos)
 
-                # 竊・縺薙％縺ｧ謠冗判
+                # Draw with the latest sorted data
                 glsl_renderer.draw()
             except Exception as e:
                 print(f"[LCC] Error in draw_callback: {e}")
@@ -1092,7 +1091,6 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
-    """GLSL 3DGS 繧剃ｽｿ縺｣縺溯ｻｽ驥・360ﾂｰ繝励Ξ繝薙Η繝ｼ騾｣逡ｪ蜃ｺ蜉・""
     bl_idname = "lcc.render_360_preview_glsl"
     bl_label = "Render 360 Preview (GLSL)"
     bl_options = {'REGISTER'}
@@ -1124,7 +1122,7 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
         default=512,
         min=64,
         max=4096,
-        description="繧ｭ繝･繝ｼ繝悶・繝・・1髱｢縺ｮ隗｣蜒丞ｺｦ (譛ｪ險ｭ螳壹↑繧・width/4 繧定・蜍穂ｽｿ逕ｨ)"
+        description="キューブマップ1面の解像度。未指定時は width/4 を使用します。"
     )
     output_dir: bpy.props.StringProperty(
         name="Output Directory",
@@ -1135,13 +1133,16 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
     def execute(self, context):
         global glsl_renderer
         if glsl_renderer is None:
-            self.report({'ERROR'}, "GLSL Renderer 縺悟・譛溷喧縺輔ｌ縺ｦ縺・∪縺帙ｓ・・mport LCC 縺ｧ 'Use GLSL Viewport' 繧呈怏蜉ｹ縺ｫ縺励※隱ｭ縺ｿ霎ｼ縺ｿ逶ｴ縺励※縺上□縺輔＞・峨・)
+            self.report(
+                {'ERROR'},
+                "GLSL Renderer が初期化されていません。Import LCC で 'Use GLSL Viewport' を有効にしてから再実行してください。"
+            )
             return {'CANCELLED'}
 
         scene = context.scene
         cam = scene.camera
         if cam is None:
-            self.report({'ERROR'}, "繧ｷ繝ｼ繝ｳ縺ｫ繧｢繧ｯ繝・ぅ繝悶き繝｡繝ｩ縺後≠繧翫∪縺帙ｓ縲・)
+            self.report({'ERROR'}, "シーンにアクティブなカメラがありません。")
             return {'CANCELLED'}
 
         width = self.width
@@ -1151,11 +1152,11 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
         import os
         out_dir = bpy.path.abspath(self.output_dir)
         
-        # 逶ｸ蟇ｾ繝代せ縺ｮ縺ｾ縺ｾ・乗ｨｩ髯舌お繝ｩ繝ｼ縺ｫ縺ｪ縺｣縺溷ｴ蜷医・螳牙・縺ｪ蝣ｴ謇縺ｫ繝輔か繝ｼ繝ｫ繝舌ャ繧ｯ
+        # 出力先ディレクトリを作成（ブレンドファイル未保存でもホームにフォールバック）
         try:
             os.makedirs(out_dir, exist_ok=True)
         except PermissionError:
-            # .blend 縺御ｿ晏ｭ倥＆繧後※縺・ｌ縺ｰ縺昴・繝輔か繝ｫ繝驟堺ｸ九√↑縺代ｌ縺ｰ繝ｦ繝ｼ繧ｶ繝ｼ繝・ぅ繝ｬ繧ｯ繝医Μ
+            # .blend が未保存の場合などはホームディレクトリ配下に退避
             fallback_root = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else os.path.expanduser("~")
             out_dir = os.path.join(fallback_root, "LCC_360_Preview")
             os.makedirs(out_dir, exist_ok=True)
@@ -1163,7 +1164,7 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
 
         offscreen = gpu.types.GPUOffScreen(face_size, face_size)
 
-        # 繧ｭ繝･繝ｼ繝悶・繝・・ 6 髱｢縺ｮ譁ｹ蜷托ｼ医Ο繝ｼ繧ｫ繝ｫ霆ｸ蝓ｺ貅厄ｼ・
+        # キューブマップの6面それぞれの向き（dir, up）
         face_defs = {
             'PX': (Vector((1, 0, 0)),  Vector((0, -1, 0))),
             'NX': (Vector((-1, 0, 0)), Vector((0, -1, 0))),
@@ -1177,7 +1178,7 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
             for frame in range(self.frame_start, self.frame_end + 1):
                 scene.frame_set(frame)
 
-                # 繧ｫ繝｡繝ｩ菴咲ｽｮ縺ｨ蜷代″
+                # カメラ行列を取得
                 cam_mw = cam.matrix_world
                 eye = cam_mw.translation
                 basis = cam_mw.to_3x3()
@@ -1185,55 +1186,55 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
                 faces_np = {}
 
                 for key, (dir_local, up_local) in face_defs.items():
-                    # 繧ｫ繝｡繝ｩ繝ｭ繝ｼ繧ｫ繝ｫ 竊・繝ｯ繝ｼ繝ｫ繝画婿蜷・
+                    # ビュー方向とアップベクトルをワールド座標に変換
                     dir_world = basis @ dir_local
                     up_world = basis @ up_local
 
-                    # 縺薙・髱｢縺ｮ縲瑚ｦ九ｋ譁ｹ蜷代・
+                    # 向きに合わせたターゲットを算出
                     target = eye + dir_world
 
-                    # 縺薙％縺ｧ view / projection 陦悟・繧剃ｽ懊ｋ
+                    # view / projection 行列を構築
                     view_matrix = make_lookat(eye, target, up_world)
                     proj_matrix = make_perspective(
-                        math.radians(90.0),  # 90蠎ｦ縺ｮFOV
+                        math.radians(90.0),  # 90度のFOV
                         aspect=1.0,
                         z_near=0.1,
                         z_far=1000.0,
                     )
 
-                    # OffScreen 縺ｫ繝舌う繝ｳ繝峨＠縺ｦ謠冗判
+                    # OffScreen に描画
                     with offscreen.bind():
-                        # 迴ｾ蝨ｨ繧｢繧ｯ繝・ぅ繝悶↑繝輔Ξ繝ｼ繝繝舌ャ繝輔ぃ繧貞叙蠕・
+                        # フレームバッファを取得
                         framebuffer = gpu.state.active_framebuffer_get()
 
-                        # 豺ｱ蠎ｦ繝ｻ繝悶Ξ繝ｳ繝臥ｭ峨・繧ｹ繝・・繝郁ｨｭ螳・
+                        # 深度書き込みやブレンドを設定
                         gpu.state.depth_mask_set(True)
-                        gpu.state.depth_test_set('LESS_EQUAL')  # 蠢・ｦ√↑繧・'LESS' 縺ｧ繧０K
+                        gpu.state.depth_test_set('LESS_EQUAL')  # 'LESS' よりも少し寛容
                         gpu.state.blend_set('ALPHA_PREMULT')
 
-                        # 繧ｫ繝ｩ繝ｼ & 豺ｱ蠎ｦ繧偵け繝ｪ繧｢・・lender 4.5 謗ｨ螂ｨ繧ｹ繧ｿ繧､繝ｫ・・
+                        # Blender 4.5 以降の仕様に合わせて初期化
                         framebuffer.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
 
-                        # 縺薙％縺九ｉ螳滄圀縺ｮ 3DGS 謠冗判
+                        # 3DGS の描画
                         glsl_renderer.draw_offscreen(view_matrix, proj_matrix, face_size, face_size)
 
-                        # 繧ｫ繝ｩ繝ｼ繝舌ャ繝輔ぃ繧定ｪｭ縺ｿ蜃ｺ縺暦ｼ・ramebuffer 縺九ｉ・・
+                        # framebuffer から RGBA を取得
                         buf = framebuffer.read_color(0, 0, face_size, face_size, 4, 0, 'UBYTE')
 
-                    # memoryview 竊・繝舌う繝亥・縺ｫ縺励※ 1谺｡蜈・｣邯壹ヰ繝・ヵ繧｡縺ｫ螟画鋤
+                    # memoryview -> bytes
                     buf_bytes = bytes(buf)
 
-                    # numpy 驟榊・縺ｫ螟画鋤縺励※ (H, W, 4) 縺ｫ reshape
+                    # numpy 配列へ変換 (H, W, 4)
                     img_np = np.frombuffer(buf_bytes, dtype=np.uint8)
                     img_np = img_np.reshape((face_size, face_size, 4))
 
-                    # faces_np 縺ｫ譬ｼ邏・
+                    # face ごとに保持
                     faces_np[key] = img_np
 
-                # 6 髱｢ 竊・equirect
+                # 6面を equirect へ展開
                 equirect = cubemap_to_equirect(faces_np, width, height)
 
-                # Blender Image 邨檎罰縺ｧ PNG 菫晏ｭ・
+                # Blender Image を経由して PNG 保存
                 img = bpy.data.images.new(
                     name=f"LCC_360_preview_{frame:04d}",
                     width=width,
@@ -1241,7 +1242,7 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
                     alpha=True,
                     float_buffer=False,
                 )
-                # RGBA [0,1] 縺ｫ豁｣隕丞喧縺励※ pixels 縺ｸ
+                # RGBA [0,1] に正規化して pixels に書き戻す
                 pixels = (equirect.astype(np.float32) / 255.0).reshape(-1)
                 img.pixels = pixels.tolist()
 
@@ -1251,7 +1252,7 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
                 img.save()
                 bpy.data.images.remove(img)
 
-            self.report({'INFO'}, f"GLSL 360 Preview 繧・{out_dir} 縺ｫ蜃ｺ蜉帙＠縺ｾ縺励◆縲・)
+            self.report({'INFO'}, f"GLSL 360 Preview を {out_dir} に書き出しました。")
         finally:
             offscreen.free()
 
