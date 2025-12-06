@@ -1235,24 +1235,22 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         color_read.inputs['Name'].default_value = "SplatColor"
         color_read.location = (-1000, -300)
 
+        # -----------------
         # Scale Logic
+        # -----------------
         if distance_scale_socket is not None:
-            # Render 用: スケール = (距離 / 500) * density
-            dist_mul = nodes.new('ShaderNodeMath')
-            dist_mul.name = "LCC_DistanceDensity"
-            dist_mul.operation = 'MULTIPLY'
-            dist_mul.inputs[1].default_value = density
-            dist_mul.location = (-600, 100)
-            links.new(distance_scale_socket, dist_mul.inputs[0])
+            # Render 用:
+            #   SplatScale -> VectorMath(SCALE).Vector
+            #   距離/500   -> VectorMath(SCALE).Scale
+            scale_render = nodes.new('ShaderNodeVectorMath')
+            scale_render.name = "LCC_ScaleRender"
+            scale_render.operation = 'SCALE'
+            scale_render.location = (-600, 100)
 
-            dist_vec = nodes.new('ShaderNodeCombineXYZ')
-            dist_vec.name = "LCC_DistanceScaleVec"
-            dist_vec.location = (-450, 100)
-            links.new(dist_mul.outputs[0], dist_vec.inputs['X'])
-            links.new(dist_mul.outputs[0], dist_vec.inputs['Y'])
-            links.new(dist_mul.outputs[0], dist_vec.inputs['Z'])
+            links.new(scale_read.outputs['Attribute'], scale_render.inputs[0])
+            links.new(distance_scale_socket, scale_render.inputs[3])
 
-            scale_for_clamp = dist_vec.outputs['Vector']
+            scale_for_clamp = scale_render.outputs['Vector']
         else:
             # Viewport 用: 従来通り SplatScale * density
             scale_boost = nodes.new('ShaderNodeVectorMath')
