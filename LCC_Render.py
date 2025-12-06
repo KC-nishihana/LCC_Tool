@@ -1091,44 +1091,90 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         if "Camera" in modifier.keys(): modifier["Camera"] = target_cam
 
     def _build_render_geonodes_tree(self, node_group, density, thickness, render_dist):
+        # インターフェイス作り直し
         self._clear_interface(node_group)
-        node_group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
-        node_group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
-        node_group.interface.new_socket(name="Camera", in_out='INPUT', socket_type='NodeSocketObject')
+        node_group.interface.new_socket(
+            name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry'
+        )
+        node_group.interface.new_socket(
+            name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry'
+        )
 
         nodes = node_group.nodes
         links = node_group.links
-        for n in nodes: nodes.remove(n)
+        for n in list(nodes):
+            nodes.remove(n)
 
         input_node = nodes.new('NodeGroupInput')
         input_node.location = (-1800, 0)
         output_node = nodes.new('NodeGroupOutput')
         output_node.location = (1000, 0)
 
-        # --- LOD Distance Logic ---
+        # --- 距離計算用 ---
         pos_node = nodes.new('GeometryNodeInputPosition')
         pos_node.location = (-1000, 500)
-        
+
+        # 1) アクティブカメラノードが使えればそれを優先
+        cam_source_socket = None
+        try:
+            active_cam = nodes.new('GeometryNodeInputActiveCamera')
+            active_cam.location = (-1200, 600)
+            try:
+                cam_source_socket = active_cam.outputs['Camera']
+            except KeyError:
+                cam_source_socket = active_cam.outputs[0]
+        except Exception:
+            active_cam = None
+            cam_source_socket = None
+
+        # 2) 使えない場合は従来のグループ入力にフォールバック
+        if cam_source_socket is None:
+            node_group.interface.new_socket(
+                name="Camera", in_out='INPUT', socket_type='NodeSocketObject'
+            )
+            cam_source_socket = input_node.outputs['Camera']
+
         cam_info = nodes.new('GeometryNodeObjectInfo')
-        cam_info.transform_space = 'RELATIVE' 
+        cam_info.transform_space = 'RELATIVE'
         cam_info.location = (-1000, 600)
-        links.new(input_node.outputs['Camera'], cam_info.inputs[0])
-        
+        links.new(cam_source_socket, cam_info.inputs[0])
+
+        # カメラとの距離
         dist_node = nodes.new('ShaderNodeVectorMath')
         dist_node.operation = 'DISTANCE'
         dist_node.location = (-800, 500)
         links.new(pos_node.outputs['Position'], dist_node.inputs[0])
         links.new(cam_info.outputs['Location'], dist_node.inputs[1])
-        
+
+        # 距離を 500 で割る（Render 用スケール計算に使う）
+        dist_div = nodes.new('ShaderNodeMath')
+        dist_div.name = "LCC_DistanceDiv"
+        dist_div.operation = 'DIVIDE'
+        dist_div.inputs[1].default_value = 500.0
+        dist_div.location = (-650, 350)
+        links.new(dist_node.outputs['Value'], dist_div.inputs[0])
+
+        # 描画距離判定（LOD）
         render_compare = nodes.new('FunctionNodeCompare')
         render_compare.name = "LCC_RenderDistance"
         render_compare.data_type = 'FLOAT'
         render_compare.operation = 'LESS_THAN'
         render_compare.inputs['B'].default_value = render_dist
         render_compare.location = (-600, 500)
-        links.new(dist_node.outputs[0], render_compare.inputs['A'])
+        links.new(dist_node.outputs['Value'], render_compare.inputs['A'])
 
-        self._build_instancing_part(nodes, links, input_node, output_node, render_compare.outputs[0], density, thickness, high_detail=True)
+        # Instancing: 距離スケールを渡す
+        self._build_instancing_part(
+            nodes,
+            links,
+            input_node,
+            output_node,
+            render_compare.outputs[0],
+            density,
+            thickness,
+            high_detail=True,
+            distance_scale_socket=dist_div.outputs[0],
+        )
 
     # --- GEOMETRY NODES FOR VIEWPORT (Simple Display) ---
     def create_viewport_geonodes(self, obj, density, thickness):
@@ -1159,7 +1205,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         output_node.location = (1000, 0)
         
         # No filtering selection for viewport (show all in the proxy mesh)
-        self._build_instancing_part(nodes, links, input_node, output_node, None, density, thickness, high_detail=False)
+        self._build_instancing_part(nodes, links, input_node, output_node, None, density, thickness, high_detail=False, distance_scale_socket=None)
 
     # --- SHARED HELPERS ---
     def _clear_interface(self, node_group):
@@ -1170,8 +1216,8 @@ class IMPORT_OT_lcc(bpy.types.Operator):
              node_group.inputs.clear()
              node_group.outputs.clear()
 
-    def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness, high_detail=False):
-        """Builds the core splat instancing logic shared by both Render and Viewport"""
+    def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness, high_detail=False, distance_scale_socket=None):
+        """Builds the core splat instancing logic shared by both Render and Viewport."""
         
         # Attributes
         scale_read = nodes.new('GeometryNodeInputNamedAttribute')
@@ -1190,19 +1236,40 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         color_read.location = (-1000, -300)
 
         # Scale Logic
-        scale_boost = nodes.new('ShaderNodeVectorMath')
-        scale_boost.name = "LCC_ScaleBoost"
-        scale_boost.operation = 'SCALE'
-        scale_boost.inputs[3].default_value = density
-        scale_boost.location = (-600, 100)
-        links.new(scale_read.outputs['Attribute'], scale_boost.inputs[0])
+        if distance_scale_socket is not None:
+            # Render 用: スケール = (距離 / 500) * density
+            dist_mul = nodes.new('ShaderNodeMath')
+            dist_mul.name = "LCC_DistanceDensity"
+            dist_mul.operation = 'MULTIPLY'
+            dist_mul.inputs[1].default_value = density
+            dist_mul.location = (-600, 100)
+            links.new(distance_scale_socket, dist_mul.inputs[0])
+
+            dist_vec = nodes.new('ShaderNodeCombineXYZ')
+            dist_vec.name = "LCC_DistanceScaleVec"
+            dist_vec.location = (-450, 100)
+            links.new(dist_mul.outputs[0], dist_vec.inputs['X'])
+            links.new(dist_mul.outputs[0], dist_vec.inputs['Y'])
+            links.new(dist_mul.outputs[0], dist_vec.inputs['Z'])
+
+            scale_for_clamp = dist_vec.outputs['Vector']
+        else:
+            # Viewport 用: 従来通り SplatScale * density
+            scale_boost = nodes.new('ShaderNodeVectorMath')
+            scale_boost.name = "LCC_ScaleBoost"
+            scale_boost.operation = 'SCALE'
+            scale_boost.inputs[3].default_value = density
+            scale_boost.location = (-600, 100)
+            links.new(scale_read.outputs['Attribute'], scale_boost.inputs[0])
+
+            scale_for_clamp = scale_boost.outputs['Vector']
 
         scale_clamp = nodes.new('ShaderNodeVectorMath')
         scale_clamp.name = "LCC_ThicknessClamp"
         scale_clamp.operation = 'MAXIMUM'
         scale_clamp.inputs[1].default_value = (thickness, thickness, thickness)
         scale_clamp.location = (-400, 100)
-        links.new(scale_boost.outputs['Vector'], scale_clamp.inputs[0])
+        links.new(scale_for_clamp, scale_clamp.inputs[0])
 
         # Instancing
         instance_on_points = nodes.new('GeometryNodeInstanceOnPoints')
@@ -1552,10 +1619,16 @@ class LCC_OT_apply_display_settings(bpy.types.Operator):
             if not node_group:
                 continue
             nodes = node_group.nodes
-
-            scale_boost = nodes.get("LCC_ScaleBoost")
-            if scale_boost and len(scale_boost.inputs) > 3:
-                scale_boost.inputs[3].default_value = settings.scale_density
+            if group_name == "LCC_GN_Viewport":
+                # Viewport 用: 従来のスケール入力
+                scale_boost = nodes.get("LCC_ScaleBoost")
+                if scale_boost and len(scale_boost.inputs) > 3:
+                    scale_boost.inputs[3].default_value = settings.scale_density
+            else:
+                # Render 用: 距離スケールに掛ける density
+                dist_density = nodes.get("LCC_DistanceDensity")
+                if dist_density and len(dist_density.inputs) > 1:
+                    dist_density.inputs[1].default_value = settings.scale_density
 
             scale_clamp = nodes.get("LCC_ThicknessClamp")
             if scale_clamp and len(scale_clamp.inputs) > 1:
