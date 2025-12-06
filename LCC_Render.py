@@ -1610,7 +1610,7 @@ class LCC_PT_Panel(bpy.types.Panel):
         settings = getattr(context.scene, "lcc_display_settings", None)
         if settings is not None:
             col = layout.box()
-            col.label(text="表示パラメータ（後から調整）", icon='MOD_NODES')
+            col.label(text="表示パラメータ（後から調整）", icon='GEOMETRY_NODES')
             col.prop(settings, "scale_density")
             col.prop(settings, "min_thickness")
             col.prop(settings, "lod_distance")
