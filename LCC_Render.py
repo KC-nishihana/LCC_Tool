@@ -13,24 +13,33 @@ from mathutils import Quaternion, Vector, Matrix
 from bpy_extras.object_utils import world_to_camera_view
 import gpu
 
+# ------------------------------------------------------------------------
+# Optional GLSL renderer import helper
+# ------------------------------------------------------------------------
+
+LCCGLSLRenderer = None
+import_error_msg = ""
+
 def _resolve_script_dir():
     """
-    Determine the directory that contains this script so local imports work
-    even when Blender executes the file without a reliable __file__.
+    このスクリプトが置かれているディレクトリを返す。
+    Text ブロックから実行した場合でもローカルモジュールを import できるようにするため。
     """
-
+    # 通常の __file__ 経由
     module_file = getattr(sys.modules.get(__name__), "__file__", None)
     if module_file:
         path = Path(module_file).resolve()
         if path.exists():
             return path.parent
 
+    # Text エディタから実行されている場合
     text_block = bpy.data.texts.get("LCC_Render.py")
     if text_block and text_block.filepath:
         text_path = Path(text_block.filepath).resolve()
         if text_path.exists():
             return text_path.parent
 
+    # フレーム情報からのフォールバック
     try:
         frame_file = inspect.getsourcefile(sys.modules[__name__])
         if frame_file:
@@ -40,28 +49,15 @@ def _resolve_script_dir():
     except Exception:
         pass
 
-    for candidate in sys.path:
-        candidate_path = Path(candidate)
-        if (candidate_path / "LCC_Render.py").exists():
-            return candidate_path.resolve()
-        if (candidate_path / "LCC_GLSL_Renderer.py").exists():
-            return candidate_path.resolve()
+    return None
 
-    return Path.cwd()
+# スクリプトディレクトリを sys.path に追加して GLSL レンダラーを探す
+_script_dir = _resolve_script_dir()
+if _script_dir and str(_script_dir) not in sys.path:
+    sys.path.append(str(_script_dir))
 
-
-current_dir = _resolve_script_dir()
-if current_dir and str(current_dir) not in sys.path:
-    sys.path.append(str(current_dir))
-
-# Attempt Import with Reload support
-LCCGLSLRenderer = None
-import_error_msg = None
 try:
-    import LCC_GLSL_Renderer
-    importlib.reload(LCC_GLSL_Renderer) # Force reload to pick up changes
     from LCC_GLSL_Renderer import LCCGLSLRenderer
-    print("LCC_GLSL_Renderer module loaded successfully.")
 except Exception as e:
     import_error_msg = str(e)
     print(f"ERROR: Failed to import LCC_GLSL_Renderer: {e}")
@@ -252,10 +248,10 @@ class LCCParser:
         self.meta = {}
         self.load_meta()
 
-        # Meta.lcc transform terms (used to place points in world coordinates)
-        self.meta_offset = np.array(self.meta.get("offset", [0, 0, 0]), dtype=np.float32)
-        self.meta_shift = np.array(self.meta.get("shift", [0, 0, 0]), dtype=np.float32)
-        self.meta_scale = np.array(self.meta.get("scale", [1, 1, 1]), dtype=np.float32)
+        # Meta.lcc transform terms (kept in float64 to avoid precision loss at large scales)
+        self.meta_offset = np.array(self.meta.get("offset", [0, 0, 0]), dtype=np.float64)
+        self.meta_shift = np.array(self.meta.get("shift", [0, 0, 0]), dtype=np.float64)
+        self.meta_scale = np.array(self.meta.get("scale", [1, 1, 1]), dtype=np.float64)
 
     def load_meta(self):
         with open(self.meta_path, 'r', encoding='utf-8') as f:
@@ -370,8 +366,9 @@ class LCCParser:
             )
 
     def _apply_meta_transform(self, positions):
-        """Apply Meta.lcc offset/shift/scale to positions."""
-        return (positions + self.meta_offset + self.meta_shift) * self.meta_scale
+        """Apply Meta.lcc offset/shift/scale to positions using float64 to avoid precision loss."""
+        pos64 = np.asarray(positions, dtype=np.float64)
+        return (pos64 + self.meta_offset + self.meta_shift) * self.meta_scale
 
     def decode_attributes(self, colors_u, scales_u, rots_u, extra_u=None, apply_exp_scale=False):
         """Decode packed attributes. Opacity is applied only when non-zero data exists."""
@@ -441,6 +438,42 @@ class LCCParser:
 
         return colors, scales, quats_np, eulers, opacity
 
+
+class LCC_DisplaySettings(bpy.types.PropertyGroup):
+    # Geometry Nodes側
+    scale_density: bpy.props.FloatProperty(
+        name="スケール倍率",
+        default=1.5,
+        min=0.01,
+    )
+    min_thickness: bpy.props.FloatProperty(
+        name="最小厚み",
+        default=0.05,
+        min=0.0,
+    )
+    lod_distance: bpy.props.FloatProperty(
+        name="LOD距離",
+        default=100.0,
+        min=0.0,
+    )
+
+    # マテリアル側（ガウスの形と濃さ）
+    gauss_k: bpy.props.FloatProperty(
+        name="ガウス係数 k",
+        default=1.0,
+        min=0.01,
+    )
+    alpha_threshold: bpy.props.FloatProperty(
+        name="アルファしきい値",
+        default=0.001,
+        min=0.0,
+    )
+    alpha_boost: bpy.props.FloatProperty(
+        name="アルファ補正",
+        default=1.0,
+        min=0.0,
+    )
+
 # ------------------------------------------------------------------------
 # Blender Operator
 # ------------------------------------------------------------------------
@@ -459,7 +492,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     lod_min: bpy.props.IntProperty(name="最小LOD", default=0, min=0, max=5)
     lod_max: bpy.props.IntProperty(name="最大LOD", default=0, min=0, max=8)
 
-    scale_density: bpy.props.FloatProperty(name="スケール倍率", default=1.5, min=0.1)
+    scale_density: bpy.props.FloatProperty(name="スケール倍率", default=1.0, min=0.1)
     min_thickness: bpy.props.FloatProperty(name="最小厚み", default=0.05, min=0.0)
 
     chunk_size: bpy.props.FloatProperty(name="チャンクグリッドサイズ", default=10.0, min=1.0, description="レンダーチャンクを分割するグリッドセルの大きさ")
@@ -471,7 +504,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
     # Determines how much data is sampled for the viewport proxy object
     viewport_density: bpy.props.FloatProperty(
         name="ビューポート密度(%)",
-        default=10.0,
+        default=1.0,
         min=0.1,
         max=100.0,
         description="GLSL ビューポートレンダラーに使うポイントの割合"
@@ -488,6 +521,23 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         default=False,
         description="3DGS形式のLCCを正しく復号するためにログスケール等を展開します（チャンクとLCC_GN系ビューアは常に自前で生成）"
     )
+
+    g3ds_alpha_boost: bpy.props.FloatProperty(
+        name="3DGSアルファ補正",
+        default=2.0,
+        min=0.1,
+        max=5.0,
+        description="3DGSモード時にだけアルファ(不透明度)を持ち上げて濃く見せる係数"
+    )
+
+    g3ds_scale_boost: bpy.props.FloatProperty(
+        name="3DGSスケール補正",
+        default=1.0,
+        min=0.1,
+        max=3.0,
+        description="3DGSモード時にだけスプラットのスケールを補正する係数"
+    )
+
     g3ds_node_group: bpy.props.StringProperty(
         name="3DGSノードグループ",
         default="Gaussian splatting",
@@ -514,6 +564,13 @@ class IMPORT_OT_lcc(bpy.types.Operator):
             context.scene.collection.children.link(render_coll)
         else:
             render_coll = bpy.data.collections[render_coll_name]
+
+        # --- インポート時のパラメータをシーン設定に保存 ---
+        settings = getattr(context.scene, "lcc_display_settings", None)
+        if settings is not None:
+            settings.scale_density = self.scale_density
+            settings.min_thickness = self.min_thickness
+            settings.lod_distance = self.lod_distance
             
         # Camera setup
         if self.setup_render:
@@ -561,6 +618,16 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                         extra_u=extra_u,
                         apply_exp_scale=self.use_3dgs_attributes,
                     )
+
+                    # 3DGSモードではアルファとスケールを補正して濃さと厚みを調整
+                    if self.use_3dgs_attributes:
+                        if self.g3ds_scale_boost != 1.0:
+                            scl = scl * self.g3ds_scale_boost
+
+                        if opacity is not None:
+                            import numpy as _np
+                            opacity = _np.clip(opacity * self.g3ds_alpha_boost, 0.0, 1.0)
+                            col[:, 3] = _np.clip(col[:, 3] * self.g3ds_alpha_boost, 0.0, 1.0)
                     
                     # --- 1. Binning for Render Chunks (Grid Split) ---
                     # Calculate grid indices for each point
@@ -751,9 +818,10 @@ class IMPORT_OT_lcc(bpy.types.Operator):
                 
     def create_render_chunk(self, collection, chunk_name, positions, colors, scales, rots, lod_levels, opacities=None, hide_render_force=False):
         mesh = bpy.data.meshes.new(name=chunk_name)
-        num_points = len(positions)
+        pos32 = np.asarray(positions, dtype=np.float32)
+        num_points = len(pos32)
         mesh.vertices.add(num_points)
-        mesh.vertices.foreach_set("co", positions.flatten())
+        mesh.vertices.foreach_set("co", pos32.flatten())
         
         self._add_attributes(mesh, colors, scales, rots, lod_levels, opacities=opacities)
         
@@ -777,9 +845,10 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         mesh_name = "LCC_Viewport_Proxy"
         mesh = bpy.data.meshes.new(name=mesh_name)
         
-        num_points = len(positions)
+        pos32 = np.asarray(positions, dtype=np.float32)
+        num_points = len(pos32)
         mesh.vertices.add(num_points)
-        mesh.vertices.foreach_set("co", positions.flatten())
+        mesh.vertices.foreach_set("co", pos32.flatten())
         
         # Viewport proxy doesn't need LOD level attribute essentially, but keeping structure
         self._add_attributes(mesh, colors, scales, rots, 0, opacities=opacities)
@@ -795,32 +864,42 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         self.create_viewport_geonodes(obj, self.scale_density, self.min_thickness)
 
     def _recenter_to_origin(self, spatial_chunks, vp_pos_list, render_coll):
-        """Shift all positions so the scene is centered near the origin and store the offset."""
+        """Shift all positions so the scene is centered near the origin and store the offset (compute in float64, store in float32)."""
         if not spatial_chunks:
             return spatial_chunks, vp_pos_list, None
 
-        all_pos = []
+        all_pos64 = []
         for data in spatial_chunks.values():
             for arr in data['pos']:
                 if arr is not None and arr.size > 0:
-                    all_pos.append(arr)
+                    all_pos64.append(np.asarray(arr, dtype=np.float64))
 
-        if not all_pos:
+        if not all_pos64:
             return spatial_chunks, vp_pos_list, None
 
-        all_pos = np.concatenate(all_pos, axis=0)
-        bb_min = all_pos.min(axis=0)
-        bb_max = all_pos.max(axis=0)
+        all_pos64 = np.concatenate(all_pos64, axis=0)
+        bb_min = all_pos64.min(axis=0)
+        bb_max = all_pos64.max(axis=0)
         origin_offset = (bb_min + bb_max) * 0.5
 
         for data in spatial_chunks.values():
-            data['pos'] = [arr - origin_offset for arr in data['pos']]
+            new_pos_list = []
+            for arr in data['pos']:
+                if arr is None or arr.size == 0:
+                    new_pos_list.append(arr)
+                else:
+                    arr64 = np.asarray(arr, dtype=np.float64)
+                    new_pos_list.append((arr64 - origin_offset).astype(np.float32))
+            data['pos'] = new_pos_list
 
         if vp_pos_list:
-            vp_pos_list = [arr - origin_offset for arr in vp_pos_list]
+            vp_pos_list = [
+                (np.asarray(arr, dtype=np.float64) - origin_offset).astype(np.float32)
+                for arr in vp_pos_list
+            ]
 
         # Keep world offset so original coordinates can be recovered later
-        render_coll["lcc_world_offset"] = origin_offset.tolist()
+        render_coll["lcc_world_offset"] = [float(v) for v in origin_offset]
 
         return spatial_chunks, vp_pos_list, origin_offset
 
@@ -1042,6 +1121,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         links.new(cam_info.outputs['Location'], dist_node.inputs[1])
         
         render_compare = nodes.new('FunctionNodeCompare')
+        render_compare.name = "LCC_RenderDistance"
         render_compare.data_type = 'FLOAT'
         render_compare.operation = 'LESS_THAN'
         render_compare.inputs['B'].default_value = render_dist
@@ -1111,12 +1191,14 @@ class IMPORT_OT_lcc(bpy.types.Operator):
 
         # Scale Logic
         scale_boost = nodes.new('ShaderNodeVectorMath')
+        scale_boost.name = "LCC_ScaleBoost"
         scale_boost.operation = 'SCALE'
         scale_boost.inputs[3].default_value = density
         scale_boost.location = (-600, 100)
         links.new(scale_read.outputs['Attribute'], scale_boost.inputs[0])
 
         scale_clamp = nodes.new('ShaderNodeVectorMath')
+        scale_clamp.name = "LCC_ThicknessClamp"
         scale_clamp.operation = 'MAXIMUM'
         scale_clamp.inputs[1].default_value = (thickness, thickness, thickness)
         scale_clamp.location = (-400, 100)
@@ -1192,6 +1274,7 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         nt.links.new(tex_coord.outputs['Object'], vec_math_dot.inputs[1])
         
         math_mult_factor = nt.nodes.new('ShaderNodeMath')
+        math_mult_factor.name = "LCC_GaussK"
         math_mult_factor.operation = 'MULTIPLY'
         math_mult_factor.inputs[1].default_value = -1.0  # k in exp(-k * r^2), adjust if needed
         math_mult_factor.location = (-400, 300)
@@ -1201,16 +1284,25 @@ class IMPORT_OT_lcc(bpy.types.Operator):
         math_exp.operation = 'EXPONENT'
         math_exp.location = (-200, 300)
         nt.links.new(math_mult_factor.outputs[0], math_exp.inputs[0])
+
+        # アルファ補正用
+        alpha_boost = nt.nodes.new('ShaderNodeMath')
+        alpha_boost.name = "LCC_AlphaBoost"
+        alpha_boost.operation = 'MULTIPLY'
+        alpha_boost.inputs[1].default_value = 1.0
+        alpha_boost.location = (-200, 200)
+        nt.links.new(attr_node.outputs['Alpha'], alpha_boost.inputs[0])
         
         math_mult_alpha = nt.nodes.new('ShaderNodeMath')
         math_mult_alpha.operation = 'MULTIPLY'
         math_mult_alpha.location = (0, 200)
         nt.links.new(math_exp.outputs[0], math_mult_alpha.inputs[0])
-        nt.links.new(attr_node.outputs['Alpha'], math_mult_alpha.inputs[1])
+        nt.links.new(alpha_boost.outputs[0], math_mult_alpha.inputs[1])
         
         math_threshold = nt.nodes.new('ShaderNodeMath')
+        math_threshold.name = "LCC_AlphaThreshold"
         math_threshold.operation = 'GREATER_THAN'
-        math_threshold.inputs[1].default_value = 0.001  # tighten/loosen to control holes
+        math_threshold.inputs[1].default_value = 0.001
         math_threshold.location = (200, 300)
         nt.links.new(math_mult_alpha.outputs[0], math_threshold.inputs[0])
         
@@ -1442,6 +1534,63 @@ class LCC_OT_render_360_preview_glsl(bpy.types.Operator):
 
         return {'FINISHED'}
 
+
+class LCC_OT_apply_display_settings(bpy.types.Operator):
+    bl_idname = "lcc.apply_display_settings"
+    bl_label = "LCC表示パラメータを反映"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = getattr(scene, "lcc_display_settings", None)
+        if settings is None:
+            self.report({'ERROR'}, "LCC表示設定が見つかりません。")
+            return {'CANCELLED'}
+
+        # --- Geometry Nodes の更新 ---
+        for group_name in ("LCC_GN_Render", "LCC_GN_Viewport"):
+            node_group = bpy.data.node_groups.get(group_name)
+            if not node_group:
+                continue
+            nodes = node_group.nodes
+
+            scale_boost = nodes.get("LCC_ScaleBoost")
+            if scale_boost and len(scale_boost.inputs) > 3:
+                scale_boost.inputs[3].default_value = settings.scale_density
+
+            scale_clamp = nodes.get("LCC_ThicknessClamp")
+            if scale_clamp and len(scale_clamp.inputs) > 1:
+                t = settings.min_thickness
+                scale_clamp.inputs[1].default_value = (t, t, t)
+
+            if group_name == "LCC_GN_Render":
+                render_compare = nodes.get("LCC_RenderDistance")
+                if render_compare:
+                    try:
+                        render_compare.inputs['B'].default_value = settings.lod_distance
+                    except KeyError:
+                        if len(render_compare.inputs) > 1:
+                            render_compare.inputs[1].default_value = settings.lod_distance
+
+        # --- マテリアルの更新 ---
+        mat = bpy.data.materials.get("GaussianSplatMat")
+        if mat and mat.node_tree:
+            nodes = mat.node_tree.nodes
+
+            mult_k = nodes.get("LCC_GaussK")
+            if mult_k and len(mult_k.inputs) > 1:
+                mult_k.inputs[1].default_value = -settings.gauss_k
+
+            th = nodes.get("LCC_AlphaThreshold")
+            if th and len(th.inputs) > 1:
+                th.inputs[1].default_value = settings.alpha_threshold
+
+            alpha_boost = nodes.get("LCC_AlphaBoost")
+            if alpha_boost and len(alpha_boost.inputs) > 1:
+                alpha_boost.inputs[1].default_value = settings.alpha_boost
+
+        self.report({'INFO'}, "LCC表示パラメータを更新しました。")
+        return {'FINISHED'}
+
 class LCC_PT_Panel(bpy.types.Panel):
     bl_label = "LCCツール（ビュー/レンダー分割）"
     bl_idname = "LCC_PT_Panel"
@@ -1457,24 +1606,50 @@ class LCC_PT_Panel(bpy.types.Panel):
         col.label(text="GLSL 360プレビュー", icon='RENDER_STILL')
         col.operator("lcc.render_360_preview_glsl", text="360プレビューをレンダー (GLSL)")
 
+        # --- 表示パラメータ ---
+        settings = getattr(context.scene, "lcc_display_settings", None)
+        if settings is not None:
+            col = layout.box()
+            col.label(text="表示パラメータ（後から調整）", icon='MOD_NODES')
+            col.prop(settings, "scale_density")
+            col.prop(settings, "min_thickness")
+            col.prop(settings, "lod_distance")
+            col.separator()
+            col.prop(settings, "gauss_k")
+            col.prop(settings, "alpha_threshold")
+            col.prop(settings, "alpha_boost")
+            col.operator("lcc.apply_display_settings", text="現在のLCCに反映")
+
 classes = (
+    LCC_DisplaySettings,
     IMPORT_OT_lcc,
     LCC_OT_render_360_preview_glsl,
+    LCC_OT_apply_display_settings,
     LCC_PT_Panel,
 )
 
 def register():
     for cls in classes:
-        try: bpy.utils.unregister_class(cls)
-        except: pass
-    for cls in classes:
         bpy.utils.register_class(cls)
 
+    # シーンに表示設定用のプロパティをぶら下げる
+    bpy.types.Scene.lcc_display_settings = bpy.props.PointerProperty(
+        type=LCC_DisplaySettings
+    )
+
 def unregister():
-    for cls in classes:
-        bpy.utils.unregister_class(cls)
-    
-    # Cleanup GLSL Renderer
+    # PointerProperty を先に削除
+    if hasattr(bpy.types.Scene, "lcc_display_settings"):
+        del bpy.types.Scene.lcc_display_settings
+
+    # クラスを解除
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
+    # GLSL Renderer の後始末
     global draw_handler, glsl_renderer
     if draw_handler:
         bpy.types.SpaceView3D.draw_handler_remove(draw_handler, 'WINDOW')
