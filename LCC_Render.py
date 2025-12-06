@@ -456,6 +456,11 @@ class LCC_DisplaySettings(bpy.types.PropertyGroup):
         default=100.0,
         min=0.0,
     )
+    scale_filter_max: bpy.props.FloatProperty(
+        name="スケール上限フィルタ",
+        default=5.0,
+        min=0.0,
+    )
 
     # マテリアル側（ガウスの形と濃さ）
     gauss_k: bpy.props.FloatProperty(
@@ -1218,103 +1223,126 @@ class IMPORT_OT_lcc(bpy.types.Operator):
 
     def _build_instancing_part(self, nodes, links, input_node, output_node, selection_socket, density, thickness, high_detail=False, distance_scale_socket=None):
         """Builds the core splat instancing logic shared by both Render and Viewport."""
-        
+
         # Attributes
         scale_read = nodes.new('GeometryNodeInputNamedAttribute')
         scale_read.data_type = 'FLOAT_VECTOR'
         scale_read.inputs['Name'].default_value = "SplatScale"
-        scale_read.location = (-1000, -100)
-        
+        scale_read.location = (-1200, -100)
+
         rot_read = nodes.new('GeometryNodeInputNamedAttribute')
         rot_read.data_type = 'FLOAT_VECTOR'
         rot_read.inputs['Name'].default_value = "SplatRotation"
-        rot_read.location = (-1000, -200)
+        rot_read.location = (-1200, -200)
 
         color_read = nodes.new('GeometryNodeInputNamedAttribute')
         color_read.data_type = 'FLOAT_COLOR'
         color_read.inputs['Name'].default_value = "SplatColor"
-        color_read.location = (-1000, -300)
+        color_read.location = (-1200, -300)
 
-        # -----------------
-        # Scale Logic
-        # -----------------
+        # --- Scale Logic ---
+        # まず SplatScale に density を掛ける（ベーススケール）
+        base_scale = nodes.new('ShaderNodeVectorMath')
+        base_scale.name = "LCC_ScaleBoost"
+        base_scale.operation = 'SCALE'
+        base_scale.inputs[3].default_value = density
+        base_scale.location = (-900, 100)
+        links.new(scale_read.outputs['Attribute'], base_scale.inputs[0])
+
+        scale_for_clamp = base_scale.outputs['Vector']
+
+        # Render 用: 距離/500 をさらにスケールとして掛ける
         if distance_scale_socket is not None:
-            # Render 用:
-            #   SplatScale -> VectorMath(SCALE).Vector
-            #   距離/500   -> VectorMath(SCALE).Scale
-            scale_render = nodes.new('ShaderNodeVectorMath')
-            scale_render.name = "LCC_ScaleRender"
-            scale_render.operation = 'SCALE'
-            scale_render.location = (-600, 100)
+            dist_scale = nodes.new('ShaderNodeVectorMath')
+            dist_scale.name = "LCC_DistanceScale"
+            dist_scale.operation = 'SCALE'
+            dist_scale.location = (-700, 100)
+            links.new(scale_for_clamp, dist_scale.inputs[0])
+            links.new(distance_scale_socket, dist_scale.inputs[3])
+            scale_for_clamp = dist_scale.outputs['Vector']
 
-            links.new(scale_read.outputs['Attribute'], scale_render.inputs[0])
-            links.new(distance_scale_socket, scale_render.inputs[3])
-
-            scale_for_clamp = scale_render.outputs['Vector']
-        else:
-            # Viewport 用: 従来通り SplatScale * density
-            scale_boost = nodes.new('ShaderNodeVectorMath')
-            scale_boost.name = "LCC_ScaleBoost"
-            scale_boost.operation = 'SCALE'
-            scale_boost.inputs[3].default_value = density
-            scale_boost.location = (-600, 100)
-            links.new(scale_read.outputs['Attribute'], scale_boost.inputs[0])
-
-            scale_for_clamp = scale_boost.outputs['Vector']
-
+        # 最小厚みでクランプ
         scale_clamp = nodes.new('ShaderNodeVectorMath')
         scale_clamp.name = "LCC_ThicknessClamp"
         scale_clamp.operation = 'MAXIMUM'
         scale_clamp.inputs[1].default_value = (thickness, thickness, thickness)
-        scale_clamp.location = (-400, 100)
+        scale_clamp.location = (-500, 100)
         links.new(scale_for_clamp, scale_clamp.inputs[0])
+
+        # --- SplatScale 最大値フィルタ ---
+        # scale_clamp後のスケール(X/Y/Z)の最大値がしきい値以下のポイントだけ残す
+        sep_scale = nodes.new('ShaderNodeSeparateXYZ')
+        sep_scale.location = (-500, 300)
+        links.new(scale_clamp.outputs['Vector'], sep_scale.inputs['Vector'])
+
+        max_xy = nodes.new('ShaderNodeMath')
+        max_xy.operation = 'MAXIMUM'
+        max_xy.location = (-300, 320)
+        links.new(sep_scale.outputs['X'], max_xy.inputs[0])
+        links.new(sep_scale.outputs['Y'], max_xy.inputs[1])
+
+        max_xyz = nodes.new('ShaderNodeMath')
+        max_xyz.operation = 'MAXIMUM'
+        max_xyz.location = (-120, 320)
+        links.new(max_xy.outputs[0], max_xyz.inputs[0])
+        links.new(sep_scale.outputs['Z'], max_xyz.inputs[1])
+
+        scale_filter = nodes.new('FunctionNodeCompare')
+        scale_filter.name = "LCC_SplatScaleFilter"
+        scale_filter.data_type = 'FLOAT'
+        scale_filter.operation = 'LESS_EQUAL'
+        # フィルタしきい値の初期値 5
+        scale_filter.inputs['B'].default_value = 5.0
+        scale_filter.location = (60, 320)
+        links.new(max_xyz.outputs[0], scale_filter.inputs['A'])
+
+        # 既存の selection_socket があれば AND で合成
+        final_selection = scale_filter.outputs[0]
+        if selection_socket:
+            bool_and = nodes.new('FunctionNodeBooleanMath')
+            bool_and.operation = 'AND'
+            bool_and.location = (260, 260)
+            links.new(selection_socket, bool_and.inputs[0])
+            links.new(scale_filter.outputs[0], bool_and.inputs[1])
+            final_selection = bool_and.outputs[0]
 
         # Instancing
         instance_on_points = nodes.new('GeometryNodeInstanceOnPoints')
         instance_on_points.location = (0, 0)
         links.new(input_node.outputs['Geometry'], instance_on_points.inputs['Points'])
-        
-        if selection_socket:
-            links.new(selection_socket, instance_on_points.inputs['Selection'])
 
-        # Use Cube for both render and viewport; final size is driven by SplatScale
+        if final_selection:
+            links.new(final_selection, instance_on_points.inputs['Selection'])
+
+        # インスタンス形状（キューブ）
         mesh_node = nodes.new('GeometryNodeMeshCube')
         mesh_node.inputs['Size'].default_value = (2.0, 2.0, 2.0)
-            
         mesh_node.location = (-200, -200)
         links.new(mesh_node.outputs['Mesh'], instance_on_points.inputs['Instance'])
 
         links.new(scale_clamp.outputs['Vector'], instance_on_points.inputs['Scale'])
         links.new(rot_read.outputs['Attribute'], instance_on_points.inputs['Rotation'])
-        
-        # Store Color
+
+        # 色をインスタンス属性として保持
         store_color = nodes.new('GeometryNodeStoreNamedAttribute')
         store_color.data_type = 'FLOAT_COLOR'
         store_color.domain = 'INSTANCE'
         store_color.inputs['Name'].default_value = "viz_color"
         store_color.location = (200, 0)
-        
         links.new(instance_on_points.outputs['Instances'], store_color.inputs['Geometry'])
         links.new(color_read.outputs['Attribute'], store_color.inputs['Value'])
 
-        # Material
+        # マテリアル
         mat_node = nodes.new('GeometryNodeSetMaterial')
         mat_node.location = (400, 0)
-        
         mat_name = "GaussianSplatMat"
-        if mat_name in bpy.data.materials:
-            # We don't remove material here to avoid recreating it for every chunk
-            mat = bpy.data.materials[mat_name]
-        else:
-            mat = bpy.data.materials.new(name=mat_name)
-            mat.use_nodes = True
-            mat.blend_method = 'HASHED'
-            if hasattr(mat, 'shadow_method'): mat.shadow_method = 'NONE'
-            self._create_shader_nodes(mat)
-            
+        mat = bpy.data.materials.get(mat_name)
+        if not mat:
+            mat = bpy.data.materials.new(mat_name)
         mat_node.inputs['Material'].default_value = mat
-        
         links.new(store_color.outputs['Geometry'], mat_node.inputs['Geometry'])
+
+        # 出力
         links.new(mat_node.outputs['Geometry'], output_node.inputs['Geometry'])
 
     def _create_shader_nodes(self, mat):
@@ -1616,23 +1644,30 @@ class LCC_OT_apply_display_settings(bpy.types.Operator):
             node_group = bpy.data.node_groups.get(group_name)
             if not node_group:
                 continue
-            nodes = node_group.nodes
-            if group_name == "LCC_GN_Viewport":
-                # Viewport 用: 従来のスケール入力
-                scale_boost = nodes.get("LCC_ScaleBoost")
-                if scale_boost and len(scale_boost.inputs) > 3:
-                    scale_boost.inputs[3].default_value = settings.scale_density
-            else:
-                # Render 用: 距離スケールに掛ける density
-                dist_density = nodes.get("LCC_DistanceDensity")
-                if dist_density and len(dist_density.inputs) > 1:
-                    dist_density.inputs[1].default_value = settings.scale_density
 
+            nodes = node_group.nodes
+
+            # スケール倍率（レンダー／ビューポート共通）
+            scale_boost = nodes.get("LCC_ScaleBoost")
+            if scale_boost and len(scale_boost.inputs) > 3:
+                scale_boost.inputs[3].default_value = settings.scale_density
+
+            # 最小厚み
             scale_clamp = nodes.get("LCC_ThicknessClamp")
             if scale_clamp and len(scale_clamp.inputs) > 1:
                 t = settings.min_thickness
                 scale_clamp.inputs[1].default_value = (t, t, t)
 
+            # スケールフィルタの閾値
+            scale_filter = nodes.get("LCC_SplatScaleFilter")
+            if scale_filter:
+                try:
+                    scale_filter.inputs['B'].default_value = settings.scale_filter_max
+                except KeyError:
+                    if len(scale_filter.inputs) > 1:
+                        scale_filter.inputs[1].default_value = settings.scale_filter_max
+
+            # LOD距離（レンダーのみ）
             if group_name == "LCC_GN_Render":
                 render_compare = nodes.get("LCC_RenderDistance")
                 if render_compare:
@@ -1685,6 +1720,7 @@ class LCC_PT_Panel(bpy.types.Panel):
             col.prop(settings, "scale_density")
             col.prop(settings, "min_thickness")
             col.prop(settings, "lod_distance")
+            col.prop(settings, "scale_filter_max")
             col.separator()
             col.prop(settings, "gauss_k")
             col.prop(settings, "alpha_threshold")
